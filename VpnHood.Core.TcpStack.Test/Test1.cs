@@ -2,6 +2,7 @@
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using VpnHood.Core.Toolkit.Net;
+using VpnHood.Core.VpnAdapters.Abstractions;
 using VpnHood.Core.VpnAdapters.WinDivert;
 
 namespace VpnHood.Core.TcpStack.Test;
@@ -9,7 +10,7 @@ namespace VpnHood.Core.TcpStack.Test;
 [TestClass]
 public sealed class TcpStackIntegrationTest
 {
-    private const string TestServerIp = "11.0.0.1";
+    private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
     private const int TestDataSize = 10 * 1024 * 1024; // 10MB
 
@@ -32,17 +33,57 @@ public sealed class TcpStackIntegrationTest
             Blocking = true
         };
         
-        using var adapter = new TestWinDivertAdapter(adapterSettings, tcpStack);
+        using var adapter = new WinDivertVpnAdapter(adapterSettings);
+        
+        // Setup TCP stack integration with adapter's PacketReceived event
+        adapter.PacketReceived += (sender, packet) =>
+        {
+            try
+            {
+                Console.WriteLine($"Packet received: {packet.SourceAddress}:{packet.DestinationAddress} Protocol: {packet.Protocol}");
+                
+                // Try to process with TCP stack
+                Console.WriteLine(tcpStack.TryProcessPacket(packet.Buffer.Span)
+                    ? "Packet processed by TCP stack"
+                    : "Packet not handled by TCP stack");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing packet: {ex.Message}");
+            }
+        };
+        
+        // Setup TCP stack to send packets back through adapter
+        tcpStack.OnPacketSend = packet =>
+        {
+            try
+            {
+                Console.WriteLine($"Sending packet back: {packet.SourceAddress}:{packet.DestinationAddress}");
+                adapter.SendPacketQueued(packet);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error sending packet: {ex.Message}");
+            }
+        };
         
         // Setup echo server on our TCP stack
-        var listener = tcpStack.Listen(new IPEndPoint(IPAddress.Parse(TestServerIp), TestServerPort));
+        var listener = tcpStack.Listen(new IPEndPoint(TestServerIp, TestServerPort));
         _ = StartEchoServer(listener, completionSource);
 
         try
         {
-            // Configure and start adapter
-            await adapter.StartAsync(CancellationToken.None);
-
+            // Configure and start adapter - let's try with minimal options first
+            var options = new VpnAdapterOptions
+            {
+                SessionName = "TestSession",
+                VirtualIpNetworkV4 = IpNetwork.Parse("10.0.0.0/24"),
+                IncludeNetworks = [new IpNetwork(TestServerIp, 32)]
+            };
+            
+            Console.WriteLine("Starting WinDivert adapter...");
+            await adapter.Start(options, CancellationToken.None);
+            
             // Wait a moment for everything to initialize
             await Task.Delay(2000);
 
@@ -50,7 +91,7 @@ public sealed class TcpStackIntegrationTest
             using var tcpClient = new TcpClient();
             
             Console.WriteLine($"Connecting to {TestServerIp}:{TestServerPort}...");
-            await tcpClient.ConnectAsync(IPAddress.Parse(TestServerIp), TestServerPort);
+            await tcpClient.ConnectAsync(TestServerIp, TestServerPort);
             Console.WriteLine("Connected successfully!");
 
             await using var stream = tcpClient.GetStream();
@@ -79,142 +120,13 @@ public sealed class TcpStackIntegrationTest
         {
             try
             {
-                await adapter.StopAsync();
+                Console.WriteLine("Stopping adapter...");
+                adapter.Stop();
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error cleaning up adapter: {ex.Message}");
+                Console.WriteLine($"Error stopping adapter: {ex.Message}");
             }
-        }
-    }
-
-    // Custom adapter wrapper that integrates with our TCP stack
-    private class TestWinDivertAdapter : IDisposable
-    {
-        private readonly WinDivertVpnAdapter _adapter;
-        private readonly LocalTcpStack _tcpStack;
-        private readonly CancellationTokenSource _cts = new();
-        private Task? _packetProcessingTask;
-
-        public TestWinDivertAdapter(WinDivertVpnAdapterSettings settings, LocalTcpStack tcpStack)
-        {
-            _adapter = new WinDivertVpnAdapter(settings);
-            _tcpStack = tcpStack;
-            
-            // Setup TCP stack integration
-            _tcpStack.OnPacketSend = packet =>
-            {
-                try
-                {
-                    // Send packet back through adapter - need to access WritePacket somehow
-                    // For now, we'll use reflection as a workaround
-                    var writeMethod = typeof(WinDivertVpnAdapter).GetMethod("WritePacket", 
-                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                    writeMethod?.Invoke(_adapter, [packet]);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error writing packet to adapter: {ex.Message}");
-                }
-            };
-        }
-
-        public async Task StartAsync(CancellationToken cancellationToken)
-        {
-            // Setup adapter with test route using reflection to access protected methods
-            var addRouteMethod = typeof(WinDivertVpnAdapter).GetMethod("AddRoute", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var addAddressMethod = typeof(WinDivertVpnAdapter).GetMethod("AddAddress", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            
-            await (Task)(addRouteMethod?.Invoke(_adapter, [IpNetwork.Parse("11.0.0.0/8"), cancellationToken]) ?? Task.CompletedTask);
-            await (Task)(addAddressMethod?.Invoke(_adapter, [IpNetwork.Parse("11.0.0.1/24"), cancellationToken]) ?? Task.CompletedTask);
-            
-            // Start adapter (using protected methods via reflection for testing)
-            var adapterAddMethod = typeof(WinDivertVpnAdapter).GetMethod("AdapterAdd", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var adapterOpenMethod = typeof(WinDivertVpnAdapter).GetMethod("AdapterOpen", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            
-            await (Task)(adapterAddMethod?.Invoke(_adapter, [cancellationToken]) ?? Task.CompletedTask);
-            await (Task)(adapterOpenMethod?.Invoke(_adapter, [cancellationToken]) ?? Task.CompletedTask);
-
-            // Start packet processing
-            _packetProcessingTask = ProcessPacketsAsync();
-        }
-
-        public async Task StopAsync()
-        {
-            await _cts.CancelAsync();
-            
-            if (_packetProcessingTask != null)
-            {
-                try
-                {
-                    await _packetProcessingTask;
-                }
-                catch (OperationCanceledException)
-                {
-                    // Expected
-                }
-            }
-
-            // Stop adapter
-            var adapterCloseMethod = typeof(WinDivertVpnAdapter).GetMethod("AdapterClose", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            var adapterRemoveMethod = typeof(WinDivertVpnAdapter).GetMethod("AdapterRemove", 
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            
-            adapterCloseMethod?.Invoke(_adapter, null);
-            adapterRemoveMethod?.Invoke(_adapter, null);
-        }
-
-        private async Task ProcessPacketsAsync()
-        {
-            await Task.Run(() =>
-            {
-                var buffer = new byte[65536];
-                var readMethod = typeof(WinDivertVpnAdapter).GetMethod("ReadPacket", 
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-
-                try
-                {
-                    while (!_cts.Token.IsCancellationRequested)
-                    {
-                        // Read packet from adapter
-                        var packetReceived = (bool)(readMethod?.Invoke(_adapter, [buffer]) ?? false);
-                        
-                        if (!packetReceived) 
-                        {
-                            Thread.Sleep(1);
-                            continue;
-                        }
-
-                        Console.WriteLine("Packet received from adapter");
-
-                        // Try to process with TCP stack first
-                        if (_tcpStack.TryProcessPacket(buffer.AsSpan()))
-                        {
-                            Console.WriteLine("Packet processed by TCP stack");
-                            continue;
-                        }
-
-                        Console.WriteLine("Packet not handled by TCP stack");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    if (!_cts.Token.IsCancellationRequested)
-                        Console.WriteLine($"Packet processing error: {ex.Message}");
-                }
-            });
-        }
-
-        public void Dispose()
-        {
-            _cts.Cancel();
-            _adapter.Dispose();
-            _cts.Dispose();
         }
     }
 
