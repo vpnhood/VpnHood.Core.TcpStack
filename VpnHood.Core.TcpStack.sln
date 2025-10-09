@@ -1,13 +1,15 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.14.36518.9 d17.14
+VisualStudioVersion = 17.14.36518.9
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VpnHood.Core.TcpStack", "VpnHood.Core.TcpStack\VpnHood.Core.TcpStack.csproj", "{499DAD2D-819D-4E83-A1E7-249220A5485E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VpnHood.Core.VpnAdapters.WinTun", "..\VpnHood\Src\Core\VpnHood.Core.VpnAdapters.WinTun\VpnHood.Core.VpnAdapters.WinTun.csproj", "{B1DB8D61-5736-23F2-2E3B-887A98DE04A3}"
-EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VpnHood.Core.Packets", "..\VpnHood\Src\Core\VpnHood.Core.Packets\VpnHood.Core.Packets.csproj", "{1C0FCA33-8609-DB13-2B17-D8C32469511A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VpnHood.Core.TcpStack.Test", "VpnHood.Core.TcpStack.Test\VpnHood.Core.TcpStack.Test.csproj", "{021AB721-FC25-4086-8915-C6A1CDAE6092}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "VpnHood.Core.VpnAdapters.WinDivert", "..\VpnHood\Src\Core\VpnHood.Core.VpnAdapters.WinDivert\VpnHood.Core.VpnAdapters.WinDivert.csproj", "{8B71BB41-10A6-FD52-3E4F-26496FE7409C}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -19,14 +21,18 @@ Global
 		{499DAD2D-819D-4E83-A1E7-249220A5485E}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{499DAD2D-819D-4E83-A1E7-249220A5485E}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{499DAD2D-819D-4E83-A1E7-249220A5485E}.Release|Any CPU.Build.0 = Release|Any CPU
-		{B1DB8D61-5736-23F2-2E3B-887A98DE04A3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{B1DB8D61-5736-23F2-2E3B-887A98DE04A3}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{B1DB8D61-5736-23F2-2E3B-887A98DE04A3}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{B1DB8D61-5736-23F2-2E3B-887A98DE04A3}.Release|Any CPU.Build.0 = Release|Any CPU
 		{1C0FCA33-8609-DB13-2B17-D8C32469511A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{1C0FCA33-8609-DB13-2B17-D8C32469511A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{1C0FCA33-8609-DB13-2B17-D8C32469511A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{1C0FCA33-8609-DB13-2B17-D8C32469511A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{021AB721-FC25-4086-8915-C6A1CDAE6092}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{021AB721-FC25-4086-8915-C6A1CDAE6092}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{021AB721-FC25-4086-8915-C6A1CDAE6092}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{021AB721-FC25-4086-8915-C6A1CDAE6092}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8B71BB41-10A6-FD52-3E4F-26496FE7409C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8B71BB41-10A6-FD52-3E4F-26496FE7409C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8B71BB41-10A6-FD52-3E4F-26496FE7409C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8B71BB41-10A6-FD52-3E4F-26496FE7409C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
