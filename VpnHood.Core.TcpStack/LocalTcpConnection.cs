@@ -23,7 +23,7 @@ internal sealed class LocalTcpConnection : IDisposable
     public Quad Quad { get; }
     internal uint SndNxt { get; set; }
     public uint RcvNxt { get; private set; }
-    public TcpConnState State { get; private set; }
+    public TcpConnState State { get; internal set; }
     public CancellationToken ConnectionClosed => _cts.Token;
     private readonly CancellationTokenSource _cts = new();
     
@@ -42,7 +42,11 @@ internal sealed class LocalTcpConnection : IDisposable
         _cts.Dispose();
     }
 
-    public ValueTask SendAppDataAsync(byte[] data, CancellationToken ct = default) => _appToNet.Writer.WriteAsync(data, ct);
+    public ValueTask SendAppDataAsync(byte[] data, CancellationToken ct = default)
+    {
+        Console.WriteLine($"[LocalTcpConnection] SendAppDataAsync called with {data.Length} bytes");
+        return _appToNet.Writer.WriteAsync(data, ct);
+    }
     public IAsyncEnumerable<byte[]> ReadAppDataAsync(CancellationToken ct = default) => _netToApp.Reader.ReadAllAsync(ct);
 
     public bool TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload, LocalTcpStack stack)

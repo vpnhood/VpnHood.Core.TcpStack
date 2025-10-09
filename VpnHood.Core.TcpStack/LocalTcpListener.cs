@@ -21,8 +21,10 @@ public sealed class LocalTcpListener
 
     internal void EnqueueAccept(LocalTcpConnection conn)
     {
+        Console.WriteLine($"[LISTENER] EnqueueAccept called for {conn.Quad}");
         var stream = new LocalTcpStream(conn, _stack);
-        _acceptQueue.Writer.TryWrite(stream);
+        var success = _acceptQueue.Writer.TryWrite(stream);
+        Console.WriteLine($"[LISTENER] TryWrite result: {success}");
     }
 
     public IAsyncEnumerable<LocalTcpStream> AcceptAllAsync(CancellationToken ct = default) => _acceptQueue.Reader.ReadAllAsync(ct);

@@ -89,6 +89,13 @@ public sealed class LocalTcpStack
             {
                 Console.WriteLine($"[TCP STACK] Found existing connection for {quad}");
                 
+                // Transition from SynReceived to Established on first ACK
+                if (existing.State == TcpConnState.SynReceived && tcpPacket.Acknowledgment)
+                {
+                    Console.WriteLine($"[TCP STACK] Transitioning connection to ESTABLISHED state");
+                    existing.State = TcpConnState.Established;
+                }
+                
                 var flags = (TcpFlags)0;
                 if (tcpPacket.Finish) flags |= TcpFlags.Fin;
                 if (tcpPacket.Reset) flags |= TcpFlags.Rst;
@@ -99,7 +106,7 @@ public sealed class LocalTcpStack
                     // Send ACK back if needed
                     if (tcpPacket.Acknowledgment && tcpPacket.Payload.Length == 0 && !tcpPacket.Finish)
                     {
-                        Console.WriteLine("[TCP STACK] Pure ACK, not responding");
+                        Console.WriteLine($"[TCP STACK] Pure ACK, not responding");
                         return;
                     }
                     

@@ -47,18 +47,21 @@ public sealed class TcpStackIntegrationTest
             try
             {
                 packetCount++;
-                Console.WriteLine($"[ADAPTER] Packet #{packetCount} received: {packet.SourceAddress}:{packet.DestinationAddress} Protocol: {packet.Protocol}, Length: {packet.Buffer.Length}");
                 
                 if (packet.Protocol == IpProtocol.Tcp)
                 {
                     tcpPacketCount++;
                     var tcp = packet.ExtractTcp();
-                    Console.WriteLine($"[ADAPTER] TCP Packet #{tcpPacketCount}: {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort}, SYN={tcp.Synchronize}, ACK={tcp.Acknowledgment}");
+                    var payloadLen = tcp.Payload.Length;
+                    Console.WriteLine($"[ADAPTER] TCP Packet #{tcpPacketCount}: {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort}, SYN={tcp.Synchronize}, ACK={tcp.Acknowledgment}, PayloadLen={payloadLen}");
+                }
+                else
+                {
+                    Console.WriteLine($"[ADAPTER] Packet #{packetCount} received: {packet.SourceAddress}:{packet.DestinationAddress} Protocol: {packet.Protocol}, Length: {packet.Buffer.Length}");
                 }
                 
                 // Process with TCP stack
                 tcpStack.ProcessIncoming(packet.Buffer.Span);
-                Console.WriteLine("[ADAPTER] TCP Stack processed packet");
             }
             catch (Exception ex)
             {
@@ -72,7 +75,15 @@ public sealed class TcpStackIntegrationTest
         {
             try
             {
-                Console.WriteLine($"[TCP STACK -> ADAPTER] Sending packet back: {packet.SourceAddress} -> {packet.DestinationAddress}");
+                if (packet.Protocol == IpProtocol.Tcp)
+                {
+                    var tcp = packet.ExtractTcp();
+                    Console.WriteLine($"[TCP STACK -> ADAPTER] Sending TCP packet: {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort}, PayloadLen={tcp.Payload.Length}");
+                }
+                else
+                {
+                    Console.WriteLine($"[TCP STACK -> ADAPTER] Sending packet: {packet.SourceAddress} -> {packet.DestinationAddress}");
+                }
                 adapter.SendPacketQueued(packet);
             }
             catch (Exception ex)
@@ -175,15 +186,19 @@ public sealed class TcpStackIntegrationTest
                     {
                         try
                         {
+                            Console.WriteLine("[ECHO SERVER] Connection handler started");
                             var buffer = new byte[8192];
                             var totalEchoed = 0;
                             
                             while (true)
                             {
+                                Console.WriteLine("[ECHO SERVER] Calling ReadAsync...");
                                 var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                                Console.WriteLine($"[ECHO SERVER] ReadAsync returned {bytesRead} bytes");
                                 if (bytesRead == 0) break;
                                 
                                 // Echo the data back
+                                Console.WriteLine($"[ECHO SERVER] Echoing {bytesRead} bytes back...");
                                 await stream.WriteAsync(buffer, 0, bytesRead);
                                 totalEchoed += bytesRead;
                                 
@@ -199,6 +214,7 @@ public sealed class TcpStackIntegrationTest
                         catch (Exception ex)
                         {
                             Console.WriteLine($"[ECHO SERVER] Connection error: {ex.Message}");
+                            Console.WriteLine($"[ECHO SERVER] Stack trace: {ex.StackTrace}");
                         }
                     });
                     

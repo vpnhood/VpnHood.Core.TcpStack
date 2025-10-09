@@ -21,18 +21,28 @@ public sealed class LocalTcpStream : Stream
     {
         try
         {
+            Console.WriteLine("[LocalTcpStream] PumpIncomingAsync started");
             await foreach (var chunk in _connection.ReadAppDataAsync(_cts.Token))
             {
+                Console.WriteLine($"[LocalTcpStream] Received chunk of {chunk.Length} bytes from connection");
                 await _readPipe.Writer.WriteAsync(chunk, _cts.Token);
+                await _readPipe.Writer.FlushAsync(_cts.Token);
+                Console.WriteLine($"[LocalTcpStream] Wrote and flushed {chunk.Length} bytes to read pipe");
             }
+            Console.WriteLine("[LocalTcpStream] PumpIncomingAsync finished (no more chunks)");
         }
         catch (OperationCanceledException)
         {
-            // Expected when cancellation is requested
+            Console.WriteLine("[LocalTcpStream] PumpIncomingAsync canceled");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[LocalTcpStream] PumpIncomingAsync error: {ex.Message}");
         }
         finally
         {
             await _readPipe.Writer.CompleteAsync();
+            Console.WriteLine("[LocalTcpStream] PumpIncomingAsync completed pipe");
         }
     }
 
