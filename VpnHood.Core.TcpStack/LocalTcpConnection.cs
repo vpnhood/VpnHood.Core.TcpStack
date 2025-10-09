@@ -1,4 +1,3 @@
-using System.Net;
 using System.Threading.Channels;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;

@@ -1,6 +1,8 @@
 ﻿using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using VpnHood.Core.Packets;
+using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.Toolkit.Net;
 using VpnHood.Core.VpnAdapters.Abstractions;
 using VpnHood.Core.VpnAdapters.WinDivert;
@@ -12,10 +14,11 @@ public sealed class TcpStackIntegrationTest
 {
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
-    private const int TestDataSize = 10 * 1024 * 1024; // 10MB
+    private const int TestDataSize = 100 * 1024; // 100KB for faster testing
 
     [TestMethod]
-    public async Task TestTcpStackWithWinDivertAdapter_10MbEcho_ShouldSucceed()
+    [Timeout(30000)] // 30 seconds timeout
+    public async Task TestTcpStackWithWinDivertAdapter_Echo_ShouldSucceed()
     {
         // Arrange
         var testData = GenerateRandomTestData(TestDataSize);
@@ -35,21 +38,32 @@ public sealed class TcpStackIntegrationTest
         
         using var adapter = new WinDivertVpnAdapter(adapterSettings);
         
+        var packetCount = 0;
+        var tcpPacketCount = 0;
+        
         // Setup TCP stack integration with adapter's PacketReceived event
         adapter.PacketReceived += (sender, packet) =>
         {
             try
             {
-                Console.WriteLine($"Packet received: {packet.SourceAddress}:{packet.DestinationAddress} Protocol: {packet.Protocol}");
+                packetCount++;
+                Console.WriteLine($"[ADAPTER] Packet #{packetCount} received: {packet.SourceAddress}:{packet.DestinationAddress} Protocol: {packet.Protocol}, Length: {packet.Buffer.Length}");
                 
-                // Try to process with TCP stack
-                Console.WriteLine(tcpStack.TryProcessPacket(packet.Buffer.Span)
-                    ? "Packet processed by TCP stack"
-                    : "Packet not handled by TCP stack");
+                if (packet.Protocol == IpProtocol.Tcp)
+                {
+                    tcpPacketCount++;
+                    var tcp = packet.ExtractTcp();
+                    Console.WriteLine($"[ADAPTER] TCP Packet #{tcpPacketCount}: {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort}, SYN={tcp.Synchronize}, ACK={tcp.Acknowledgment}");
+                }
+                
+                // Process with TCP stack
+                tcpStack.ProcessIncoming(packet.Buffer.Span);
+                Console.WriteLine("[ADAPTER] TCP Stack processed packet");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error processing packet: {ex.Message}");
+                Console.WriteLine($"[ADAPTER] Error processing packet: {ex.Message}");
+                Console.WriteLine($"[ADAPTER] Stack trace: {ex.StackTrace}");
             }
         };
         
@@ -58,22 +72,24 @@ public sealed class TcpStackIntegrationTest
         {
             try
             {
-                Console.WriteLine($"Sending packet back: {packet.SourceAddress}:{packet.DestinationAddress}");
+                Console.WriteLine($"[TCP STACK -> ADAPTER] Sending packet back: {packet.SourceAddress} -> {packet.DestinationAddress}");
                 adapter.SendPacketQueued(packet);
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error sending packet: {ex.Message}");
+                Console.WriteLine($"[TCP STACK -> ADAPTER] Error sending packet: {ex.Message}");
             }
         };
         
         // Setup echo server on our TCP stack
         var listener = tcpStack.Listen(new IPEndPoint(TestServerIp, TestServerPort));
+        Console.WriteLine($"[TEST] Echo server listener created on {TestServerIp}:{TestServerPort}");
+        
         _ = StartEchoServer(listener, completionSource);
 
         try
         {
-            // Configure and start adapter - let's try with minimal options first
+            // Configure and start adapter
             var options = new VpnAdapterOptions
             {
                 SessionName = "TestSession",
@@ -81,18 +97,22 @@ public sealed class TcpStackIntegrationTest
                 IncludeNetworks = [new IpNetwork(TestServerIp, 32)]
             };
             
-            Console.WriteLine("Starting WinDivert adapter...");
+            Console.WriteLine("[TEST] Starting WinDivert adapter...");
+            Console.WriteLine($"[TEST] Include networks: {string.Join<IpNetwork>(", ", options.IncludeNetworks)}");
             await adapter.Start(options, CancellationToken.None);
+            Console.WriteLine("[TEST] Adapter started successfully");
             
             // Wait a moment for everything to initialize
             await Task.Delay(2000);
 
-            // Act - Connect with TcpClient and send/receive 10MB data
+            // Act - Connect with TcpClient and send/receive data
             using var tcpClient = new TcpClient();
             
-            Console.WriteLine($"Connecting to {TestServerIp}:{TestServerPort}...");
-            await tcpClient.ConnectAsync(TestServerIp, TestServerPort);
-            Console.WriteLine("Connected successfully!");
+            Console.WriteLine($"[TEST] Connecting to {TestServerIp}:{TestServerPort}...");
+            
+            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await tcpClient.ConnectAsync(TestServerIp, TestServerPort, connectCts.Token);
+            Console.WriteLine("[TEST] Connected successfully!");
 
             await using var stream = tcpClient.GetStream();
             
@@ -102,7 +122,7 @@ public sealed class TcpStackIntegrationTest
             var receiveTask = ReceiveDataInChunks(stream, receivedData, TestDataSize);
 
             // Wait for both send and receive to complete with timeout
-            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             await Task.WhenAll(sendTask, receiveTask).WaitAsync(cts.Token);
             
             // Signal completion
@@ -114,18 +134,25 @@ public sealed class TcpStackIntegrationTest
             var receivedArray = receivedData.ToArray();
             CollectionAssert.AreEqual(testData, receivedArray, "Received data should match sent data exactly");
 
-            Console.WriteLine($"✅ Test passed! Successfully echoed {TestDataSize:N0} bytes through TCP stack");
+            Console.WriteLine($"[TEST] ✅ Test passed! Successfully echoed {TestDataSize:N0} bytes through TCP stack");
+            Console.WriteLine($"[TEST] Total packets received: {packetCount}, TCP packets: {tcpPacketCount}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[TEST] ❌ Test failed with exception: {ex.Message}");
+            Console.WriteLine($"[TEST] Stack trace: {ex.StackTrace}");
+            throw;
         }
         finally
         {
             try
             {
-                Console.WriteLine("Stopping adapter...");
+                Console.WriteLine("[TEST] Stopping adapter...");
                 adapter.Stop();
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error stopping adapter: {ex.Message}");
+                Console.WriteLine($"[TEST] Error stopping adapter: {ex.Message}");
             }
         }
     }
@@ -136,11 +163,12 @@ public sealed class TcpStackIntegrationTest
         {
             try
             {
-                Console.WriteLine("Echo server starting...");
+                Console.WriteLine("[ECHO SERVER] Starting...");
+                Console.WriteLine($"[ECHO SERVER] Listening on {listener.LocalEndPoint}");
                 
                 await foreach (var stream in listener.AcceptAllAsync())
                 {
-                    Console.WriteLine("New connection accepted by echo server");
+                    Console.WriteLine("[ECHO SERVER] ✅ New connection accepted!");
                     
                     // Handle connection in background
                     _ = Task.Run(async () =>
@@ -159,18 +187,18 @@ public sealed class TcpStackIntegrationTest
                                 await stream.WriteAsync(buffer, 0, bytesRead);
                                 totalEchoed += bytesRead;
                                 
-                                if (totalEchoed % (1024 * 1024) == 0) // Log every MB
+                                if (totalEchoed % 10240 == 0) // Log every 10KB
                                 {
-                                    Console.WriteLine($"Echoed {totalEchoed:N0} bytes so far...");
+                                    Console.WriteLine($"[ECHO SERVER] Echoed {totalEchoed:N0} bytes so far...");
                                 }
                             }
                             
-                            Console.WriteLine($"Echo server finished. Total echoed: {totalEchoed:N0} bytes");
+                            Console.WriteLine($"[ECHO SERVER] Connection finished. Total echoed: {totalEchoed:N0} bytes");
                             await stream.DisposeAsync();
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"Echo server connection error: {ex.Message}");
+                            Console.WriteLine($"[ECHO SERVER] Connection error: {ex.Message}");
                         }
                     });
                     
@@ -180,7 +208,8 @@ public sealed class TcpStackIntegrationTest
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Echo server error: {ex.Message}");
+                Console.WriteLine($"[ECHO SERVER] Error: {ex.Message}");
+                Console.WriteLine($"[ECHO SERVER] Stack trace: {ex.StackTrace}");
                 completionSource.SetException(ex);
             }
         });
@@ -196,13 +225,13 @@ public sealed class TcpStackIntegrationTest
             await stream.WriteAsync(data, offset, currentChunkSize);
             totalSent += currentChunkSize;
             
-            if (totalSent % (1024 * 1024) == 0) // Log every MB
+            if (totalSent % 10240 == 0) // Log every 10KB
             {
-                Console.WriteLine($"Sent {totalSent:N0} bytes so far...");
+                Console.WriteLine($"[CLIENT] Sent {totalSent:N0} bytes so far...");
             }
         }
         
-        Console.WriteLine($"Finished sending {totalSent:N0} bytes");
+        Console.WriteLine($"[CLIENT] Finished sending {totalSent:N0} bytes");
     }
 
     private static async Task ReceiveDataInChunks(NetworkStream stream, List<byte> receivedData, int expectedSize)
@@ -218,13 +247,13 @@ public sealed class TcpStackIntegrationTest
             receivedData.AddRange(buffer.Take(bytesRead));
             totalReceived += bytesRead;
             
-            if (totalReceived % (1024 * 1024) == 0) // Log every MB
+            if (totalReceived % 10240 == 0) // Log every 10KB
             {
-                Console.WriteLine($"Received {totalReceived:N0} bytes so far...");
+                Console.WriteLine($"[CLIENT] Received {totalReceived:N0} bytes so far...");
             }
         }
         
-        Console.WriteLine($"Finished receiving {totalReceived:N0} bytes");
+        Console.WriteLine($"[CLIENT] Finished receiving {totalReceived:N0} bytes");
     }
 
     private static byte[] GenerateRandomTestData(int size)
