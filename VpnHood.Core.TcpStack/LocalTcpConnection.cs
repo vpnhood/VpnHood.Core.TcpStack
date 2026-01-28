@@ -70,32 +70,40 @@ internal sealed class LocalTcpConnection : IDisposable
 
     public async Task EmitPendingAsync(LocalTcpStack stack, CancellationToken ct)
     {
-        while (State != TcpConnState.Closed && await _appToNet.Reader.WaitToReadAsync(ct))
+        try
         {
-            while (_appToNet.Reader.TryRead(out var data))
+            while (State != TcpConnState.Closed && await _appToNet.Reader.WaitToReadAsync(ct))
             {
-                if (data.Length == 0) continue;
+                while (_appToNet.Reader.TryRead(out var data))
+                {
+                    if (data.Length == 0) continue;
+                    
+                    // Create TCP packet using PacketBuilder
+                    var tcpPacket = PacketBuilder.BuildTcp(
+                        Quad.Destination, Quad.Source, // reversed because quad stored original SYN direction
+                        ReadOnlySpan<byte>.Empty, // no options
+                        data);
+                    
+                    var tcp = tcpPacket.ExtractTcp();
+                    tcp.SequenceNumber = SndNxt;
+                    tcp.AcknowledgmentNumber = RcvNxt;
+                    tcp.Acknowledgment = true;
+                    tcp.Push = true;
+                    tcp.WindowSize = 65535; // Advertise large receive window
+                    
+                    SndNxt += (uint)data.Length;
+                    stack.SendPacket(tcpPacket);
+                }
                 
-                // Create TCP packet using PacketBuilder
-                var tcpPacket = PacketBuilder.BuildTcp(
-                    Quad.Destination, Quad.Source, // reversed because quad stored original SYN direction
-                    ReadOnlySpan<byte>.Empty, // no options
-                    data);
-                
-                var tcp = tcpPacket.ExtractTcp();
-                tcp.SequenceNumber = SndNxt;
-                tcp.AcknowledgmentNumber = RcvNxt;
-                tcp.Acknowledgment = true;
-                tcp.Push = true;
-                
-                SndNxt += (uint)data.Length;
-                stack.SendPacket(tcpPacket);
+                if (_finSent && State == TcpConnState.Closing)
+                {
+                    Close();
+                }
             }
-            
-            if (_finSent && State == TcpConnState.Closing)
-            {
-                Close();
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when connection is closed
         }
     }
 
@@ -116,6 +124,7 @@ internal sealed class LocalTcpConnection : IDisposable
             tcp.AcknowledgmentNumber = RcvNxt;
             tcp.Finish = true;
             tcp.Acknowledgment = true;
+            tcp.WindowSize = 65535; // Advertise large receive window
             
             SndNxt += 1;
             stack.SendPacket(tcpPacket);

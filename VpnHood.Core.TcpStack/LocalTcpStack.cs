@@ -98,6 +98,7 @@ public sealed class LocalTcpStack
         synAckTcp.AcknowledgmentNumber = tcpPacket.SequenceNumber + 1;
         synAckTcp.Synchronize = true;
         synAckTcp.Acknowledgment = true;
+        synAckTcp.WindowSize = 65535; // Advertise large receive window
 
         SendPacket(synAckPacket);
         conn.SndNxt += 1; // SYN counts as one sequence number
@@ -134,6 +135,7 @@ public sealed class LocalTcpStack
         ackTcp.SequenceNumber = conn.SndNxt;
         ackTcp.AcknowledgmentNumber = conn.RcvNxt;
         ackTcp.Acknowledgment = true;
+        ackTcp.WindowSize = 65535; // Advertise large receive window
 
         SendPacket(ackPacket);
     }

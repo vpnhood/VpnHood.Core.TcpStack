@@ -1,6 +1,7 @@
 ﻿using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Text;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.Toolkit.Net;
@@ -15,6 +16,222 @@ public sealed class TcpStackIntegrationTest
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
     private const int TestDataSize = 100 * 1024; // 100KB for faster testing
+
+    /// <summary>
+    /// Diagnostic test with minimal data to understand WinDivert integration issues
+    /// </summary>
+    [TestMethod]
+    [Timeout(60000)] // 60 seconds for debugging
+    public async Task DiagnosticTest_SmallData_WinDivert()
+    {
+        Console.WriteLine("=== DIAGNOSTIC TEST START ===");
+        Console.WriteLine($"Test Server: {TestServerIp}:{TestServerPort}");
+        
+        var tcpStack = new LocalTcpStack();
+        var adapterSettings = new WinDivertVpnAdapterSettings
+        {
+            AdapterName = "VpnHoodTest",
+            ExcludeLocalNetwork = false,
+            SimulateDns = false,
+            AutoDisposePackets = true,
+            Blocking = true,
+        };
+        
+        using var adapter = new WinDivertVpnAdapter(adapterSettings);
+
+        var incomingPackets = new List<(DateTime Time, string Info, byte[] Data)>();
+        var outgoingPackets = new List<(DateTime Time, string Info, byte[] Data)>();
+        
+        // Detailed packet logging
+        adapter.PacketReceived += (_, packet) =>
+        {
+            var time = DateTime.Now;
+            var info = $"Proto={packet.Protocol}, Src={packet.SourceAddress}, Dst={packet.DestinationAddress}, Len={packet.Buffer.Length}";
+            
+            if (packet.Protocol == IpProtocol.Tcp)
+            {
+                var tcp = packet.ExtractTcp();
+                info = $"TCP {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort} " +
+                       $"[SYN={tcp.Synchronize}, ACK={tcp.Acknowledgment}, FIN={tcp.Finish}, RST={tcp.Reset}, PSH={tcp.Push}] " +
+                       $"Seq={tcp.SequenceNumber}, AckNum={tcp.AcknowledgmentNumber}, PayloadLen={tcp.Payload.Length}";
+                
+                if (tcp.Payload.Length > 0)
+                {
+                    var payloadHex = BitConverter.ToString(tcp.Payload.Span.ToArray().Take(Math.Min(32, tcp.Payload.Length)).ToArray());
+                    info += $", PayloadHex={payloadHex}";
+                }
+            }
+            
+            Console.WriteLine($"[{time:HH:mm:ss.fff}] <<< INCOMING: {info}");
+            lock (incomingPackets) incomingPackets.Add((time, info, packet.Buffer.ToArray()));
+            
+            tcpStack.ProcessIncoming(packet.Buffer.Span);
+        };
+        
+        tcpStack.OnPacketSend = packet =>
+        {
+            var time = DateTime.Now;
+            var info = $"Proto={packet.Protocol}, Src={packet.SourceAddress}, Dst={packet.DestinationAddress}";
+            
+            if (packet.Protocol == IpProtocol.Tcp)
+            {
+                var tcp = packet.ExtractTcp();
+                info = $"TCP {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort} " +
+                       $"[SYN={tcp.Synchronize}, ACK={tcp.Acknowledgment}, FIN={tcp.Finish}, RST={tcp.Reset}, PSH={tcp.Push}] " +
+                       $"Seq={tcp.SequenceNumber}, AckNum={tcp.AcknowledgmentNumber}, PayloadLen={tcp.Payload.Length}";
+                
+                if (tcp.Payload.Length > 0)
+                {
+                    var payloadHex = BitConverter.ToString(tcp.Payload.Span.ToArray().Take(Math.Min(32, tcp.Payload.Length)).ToArray());
+                    info += $", PayloadHex={payloadHex}";
+                }
+            }
+            
+            Console.WriteLine($"[{time:HH:mm:ss.fff}] >>> OUTGOING: {info}");
+            lock (outgoingPackets) outgoingPackets.Add((time, info, packet.Buffer.ToArray()));
+            
+            // ReSharper disable once AccessToDisposedClosure
+            adapter.SendPacketQueued(packet);
+        };
+        
+        // Setup listener
+        var listener = tcpStack.Listen(new IPEndPoint(TestServerIp, TestServerPort));
+        Console.WriteLine($"[SETUP] TCP Stack listening on {TestServerIp}:{TestServerPort}");
+        
+        // Simple echo server that logs everything
+        var serverReceivedData = new List<byte>();
+        var serverTask = Task.Run(async () =>
+        {
+            Console.WriteLine("[SERVER] Waiting for connection...");
+            await foreach (var stream in listener.AcceptAllAsync())
+            {
+                Console.WriteLine("[SERVER] ✅ Connection accepted!");
+                try
+                {
+                    var buffer = new byte[1024];
+                    while (true)
+                    {
+                        Console.WriteLine("[SERVER] Waiting for data...");
+                        var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                        Console.WriteLine($"[SERVER] Read {bytesRead} bytes");
+                        
+                        if (bytesRead == 0)
+                        {
+                            Console.WriteLine("[SERVER] Connection closed by client");
+                            break;
+                        }
+                        
+                        lock (serverReceivedData)
+                            serverReceivedData.AddRange(buffer.Take(bytesRead));
+                        
+                        var dataHex = BitConverter.ToString(buffer.Take(Math.Min(32, bytesRead)).ToArray());
+                        Console.WriteLine($"[SERVER] Received data (hex): {dataHex}");
+                        
+                        Console.WriteLine($"[SERVER] Echoing {bytesRead} bytes back...");
+                        await stream.WriteAsync(buffer, 0, bytesRead);
+                        Console.WriteLine($"[SERVER] Echo complete");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[SERVER] Error: {ex.Message}");
+                }
+                break;
+            }
+        });
+
+        try
+        {
+            // Start adapter
+            var options = new VpnAdapterOptions
+            {
+                SessionName = "DiagTest",
+                VirtualIpNetworkV4 = IpNetwork.Parse("10.0.0.0/24"),
+                IncludeNetworks = [new IpNetwork(TestServerIp, 32)]
+            };
+            
+            Console.WriteLine("[SETUP] Starting WinDivert adapter...");
+            await adapter.Start(options, CancellationToken.None);
+            Console.WriteLine("[SETUP] Adapter started");
+            
+            await Task.Delay(1000); // Wait for setup
+            
+            // Connect with TcpClient
+            Console.WriteLine("[CLIENT] Creating TcpClient...");
+            using var tcpClient = new TcpClient();
+            tcpClient.NoDelay = true; // Disable Nagle's algorithm
+            
+            Console.WriteLine($"[CLIENT] Connecting to {TestServerIp}:{TestServerPort}...");
+            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await tcpClient.ConnectAsync(TestServerIp, TestServerPort, connectCts.Token);
+            Console.WriteLine("[CLIENT] Connected!");
+            
+            await using var stream = tcpClient.GetStream();
+            
+            // Send just 5 bytes: "HELLO"
+            var testData = Encoding.ASCII.GetBytes("HELLO");
+            Console.WriteLine($"[CLIENT] Sending {testData.Length} bytes: {BitConverter.ToString(testData)}");
+            await stream.WriteAsync(testData);
+            await stream.FlushAsync();
+            Console.WriteLine("[CLIENT] Data sent, waiting for echo...");
+            
+            // Wait for echo
+            var receiveBuffer = new byte[100];
+            using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            
+            var totalReceived = 0;
+            while (totalReceived < testData.Length)
+            {
+                Console.WriteLine($"[CLIENT] Waiting to receive (got {totalReceived}/{testData.Length} so far)...");
+                var bytesRead = await stream.ReadAsync(receiveBuffer.AsMemory(totalReceived), readCts.Token);
+                Console.WriteLine($"[CLIENT] Received {bytesRead} bytes");
+                
+                if (bytesRead == 0)
+                {
+                    Console.WriteLine("[CLIENT] Connection closed");
+                    break;
+                }
+                totalReceived += bytesRead;
+            }
+            
+            Console.WriteLine($"[CLIENT] Total received: {totalReceived} bytes");
+            Console.WriteLine($"[CLIENT] Received data: {BitConverter.ToString(receiveBuffer.Take(totalReceived).ToArray())}");
+            
+            // Summary
+            Console.WriteLine("\n=== PACKET SUMMARY ===");
+            Console.WriteLine($"Incoming packets: {incomingPackets.Count}");
+            Console.WriteLine($"Outgoing packets: {outgoingPackets.Count}");
+            Console.WriteLine($"Server received bytes: {serverReceivedData.Count}");
+            
+            // Assert
+            Assert.AreEqual(testData.Length, totalReceived, "Should receive all echoed data");
+            CollectionAssert.AreEqual(testData, receiveBuffer.Take(totalReceived).ToArray(), "Echoed data should match");
+            
+            Console.WriteLine("\n=== TEST PASSED ===");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n=== TEST FAILED ===");
+            Console.WriteLine($"Exception: {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine($"Stack: {ex.StackTrace}");
+            
+            Console.WriteLine("\n=== PACKET DUMP ===");
+            Console.WriteLine("--- Incoming packets ---");
+            foreach (var (time, info, _) in incomingPackets)
+                Console.WriteLine($"  [{time:HH:mm:ss.fff}] {info}");
+            
+            Console.WriteLine("--- Outgoing packets ---");
+            foreach (var (time, info, _) in outgoingPackets)
+                Console.WriteLine($"  [{time:HH:mm:ss.fff}] {info}");
+            
+            throw;
+        }
+        finally
+        {
+            Console.WriteLine("[CLEANUP] Stopping adapter...");
+            adapter.Stop();
+        }
+    }
 
     [TestMethod]
     [Timeout(30000)] // 30 seconds timeout
@@ -42,7 +259,7 @@ public sealed class TcpStackIntegrationTest
         var tcpPacketCount = 0;
         
         // Setup TCP stack integration with adapter's PacketReceived event
-        adapter.PacketReceived += (sender, packet) =>
+        adapter.PacketReceived += (_, packet) =>
         {
             try
             {
@@ -83,6 +300,7 @@ public sealed class TcpStackIntegrationTest
                 {
                     Console.WriteLine($"[TCP STACK -> ADAPTER] Sending packet: {packet.SourceAddress} -> {packet.DestinationAddress}");
                 }
+                // ReSharper disable once AccessToDisposedClosure
                 adapter.SendPacketQueued(packet);
             }
             catch (Exception ex)
