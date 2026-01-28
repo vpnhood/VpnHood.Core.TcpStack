@@ -60,7 +60,7 @@ public sealed class LocalTcpStack
             var quad = new Quad(srcEndPoint, dstEndPoint);
 
             // Handle SYN packets (new connection requests)
-            if (tcpPacket.Synchronize && !tcpPacket.Acknowledgment)
+            if (tcpPacket is { Synchronize: true, Acknowledgment: false })
             {
                 HandleSynPacket(quad, dstEndPoint, srcEndPoint, tcpPacket);
                 return;
@@ -124,7 +124,7 @@ public sealed class LocalTcpStack
             return;
 
         // Don't respond to pure ACKs (no payload, no FIN)
-        if (tcpPacket.Acknowledgment && tcpPacket.Payload.Length == 0 && !tcpPacket.Finish)
+        if (tcpPacket is { Acknowledgment: true, Payload.Length: 0, Finish: false })
             return;
 
         // Send ACK for received data or FIN
