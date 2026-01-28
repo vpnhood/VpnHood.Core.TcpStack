@@ -1,4 +1,6 @@
 using System.IO.Pipelines;
+using System.Runtime.InteropServices;
+using VpnHood.Core.Toolkit.Utils;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -30,17 +32,12 @@ public sealed class LocalTcpStream : Stream
                 await _readPipe.Writer.WriteAsync(chunk, _cts.Token);
                 await _readPipe.Writer.FlushAsync(_cts.Token);
             }
+            // Complete the pipe when done
+            await _readPipe.Writer.CompleteAsync();
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (_disposed)
         {
-            // Expected when stream is disposed
-        }
-        catch
-        {
-            // Silently ignore other errors
-        }
-        finally
-        {
+            // Ignore cancellation during disposal and complete the pipe
             await _readPipe.Writer.CompleteAsync();
         }
     }
@@ -61,46 +58,50 @@ public sealed class LocalTcpStream : Stream
 
     public override int Read(byte[] buffer, int offset, int count)
     {
-        return ReadAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
+        throw new NotSupportedException("Read is not supported. Use ReadAsync instead.");
     }
 
     /// <inheritdoc />
-    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        return ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    /// <inheritdoc />
+    public override async ValueTask<int> ReadAsync(
+        Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        // Read data from the internal pipe
         using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
-        var readResult = await _readPipe.Reader.ReadAsync(combinedCts.Token);
+        var readResult = await _readPipe.Reader.ReadAsync(combinedCts.Token).Vhc();
         if (readResult.IsCanceled || readResult is { IsCompleted: true, Buffer.IsEmpty: true })
             return 0;
 
-        var bytesToCopy = Math.Min(count, (int)readResult.Buffer.Length);
+        // Copy data to the provided buffer
+        var bytesToCopy = Math.Min(buffer.Length, (int)readResult.Buffer.Length);
         var sliceToRead = readResult.Buffer.Slice(0, bytesToCopy);
-
-        // Copy from ReadOnlySequence to the target buffer
         var copied = 0;
         foreach (var segment in sliceToRead)
         {
             var toCopy = Math.Min(segment.Length, bytesToCopy - copied);
-            segment.Span[..toCopy].CopyTo(buffer.AsSpan(offset + copied));
+            segment.Span[..toCopy].CopyTo(buffer.Span.Slice(copied));
             copied += toCopy;
             if (copied >= bytesToCopy) break;
         }
 
+        // Advance the pipe reader
         _readPipe.Reader.AdvanceTo(readResult.Buffer.GetPosition(bytesToCopy));
         return bytesToCopy;
     }
 
-    /// <inheritdoc />
-    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-    {
-        return new ValueTask<int>(ReadAsync(buffer.ToArray(), 0, buffer.Length, cancellationToken));
-    }
 
     /// <inheritdoc />
     public override void Write(byte[] buffer, int offset, int count)
     {
-        WriteAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
+        throw new NotSupportedException("Write is not supported. Use WriteAsync instead.");
     }
 
     /// <inheritdoc />
@@ -120,6 +121,7 @@ public sealed class LocalTcpStream : Stream
     {
         return new ValueTask(WriteAsync(buffer.ToArray(), 0, buffer.Length, cancellationToken));
     }
+
 
     public override void Flush() { }
 
