@@ -10,7 +10,9 @@ namespace VpnHood.Core.TcpStack;
 /// </summary>
 public sealed class LocalTcpListener
 {
-    private readonly Channel<LocalTcpStream> _acceptQueue = Channel.CreateUnbounded<LocalTcpStream>(new UnboundedChannelOptions { SingleReader = true });
+    private readonly Channel<LocalTcpStream> _acceptQueue = Channel.CreateUnbounded<LocalTcpStream>(
+        new UnboundedChannelOptions { SingleReader = true });
+
     private readonly LocalTcpStack _stack;
 
     /// <summary>

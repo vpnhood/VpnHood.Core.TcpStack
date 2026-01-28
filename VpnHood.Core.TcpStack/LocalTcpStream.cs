@@ -45,26 +45,20 @@ public sealed class LocalTcpStream : Stream
         }
     }
 
-    /// <inheritdoc />
     public override bool CanRead => !_disposed;
 
-    /// <inheritdoc />
     public override bool CanWrite => !_disposed;
 
-    /// <inheritdoc />
     public override bool CanSeek => false;
 
-    /// <inheritdoc />
     public override long Length => throw new NotSupportedException();
 
-    /// <inheritdoc />
     public override long Position
     {
         get => throw new NotSupportedException();
         set => throw new NotSupportedException();
     }
 
-    /// <inheritdoc />
     public override int Read(byte[] buffer, int offset, int count)
     {
         return ReadAsync(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult();
@@ -77,8 +71,7 @@ public sealed class LocalTcpStream : Stream
 
         using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
         var readResult = await _readPipe.Reader.ReadAsync(combinedCts.Token);
-
-        if (readResult.IsCanceled || (readResult.IsCompleted && readResult.Buffer.IsEmpty))
+        if (readResult.IsCanceled || readResult is { IsCompleted: true, Buffer.IsEmpty: true })
             return 0;
 
         var bytesToCopy = Math.Min(count, (int)readResult.Buffer.Length);
@@ -128,19 +121,14 @@ public sealed class LocalTcpStream : Stream
         return new ValueTask(WriteAsync(buffer.ToArray(), 0, buffer.Length, cancellationToken));
     }
 
-    /// <inheritdoc />
     public override void Flush() { }
 
-    /// <inheritdoc />
     public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
-    /// <inheritdoc />
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
 
-    /// <inheritdoc />
     public override void SetLength(long value) => throw new NotSupportedException();
 
-    /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
         if (!_disposed && disposing)
@@ -150,6 +138,7 @@ public sealed class LocalTcpStream : Stream
             _connection.StartFin(_stack);
             _cts.Dispose();
         }
+
         base.Dispose(disposing);
     }
 }
