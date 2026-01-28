@@ -33,11 +33,11 @@ public sealed class TcpStackIntegrationTest
             SimulateDns = false,
             // Required properties
             AutoDisposePackets = true,
-            Blocking = true
+            Blocking = true,
         };
         
         using var adapter = new WinDivertVpnAdapter(adapterSettings);
-        
+
         var packetCount = 0;
         var tcpPacketCount = 0;
         
@@ -47,7 +47,6 @@ public sealed class TcpStackIntegrationTest
             try
             {
                 packetCount++;
-                
                 if (packet.Protocol == IpProtocol.Tcp)
                 {
                     tcpPacketCount++;
@@ -113,9 +112,6 @@ public sealed class TcpStackIntegrationTest
             await adapter.Start(options, CancellationToken.None);
             Console.WriteLine("[TEST] Adapter started successfully");
             
-            // Wait a moment for everything to initialize
-            await Task.Delay(2000);
-
             // Act - Connect with TcpClient and send/receive data
             using var tcpClient = new TcpClient();
             

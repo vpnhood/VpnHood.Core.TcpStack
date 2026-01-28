@@ -44,7 +44,6 @@ internal sealed class LocalTcpConnection : IDisposable
 
     public ValueTask SendAppDataAsync(byte[] data, CancellationToken ct = default)
     {
-        Console.WriteLine($"[LocalTcpConnection] SendAppDataAsync called with {data.Length} bytes");
         return _appToNet.Writer.WriteAsync(data, ct);
     }
     public IAsyncEnumerable<byte[]> ReadAppDataAsync(CancellationToken ct = default) => _netToApp.Reader.ReadAllAsync(ct);

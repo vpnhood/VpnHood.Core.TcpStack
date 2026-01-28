@@ -1,0 +1,332 @@
+using System.Net;
+using System.Security.Cryptography;
+using VpnHood.Core.Packets;
+using VpnHood.Core.Packets.Extensions;
+
+namespace VpnHood.Core.TcpStack.Test;
+
+[TestClass]
+public sealed class LocalTcpStackTest
+{
+    private static readonly IPAddress ServerIp = IPAddress.Parse("10.0.0.1");
+    private static readonly IPAddress ClientIp = IPAddress.Parse("10.0.0.2");
+    private const int ServerPort = 8080;
+    private const int ClientPort = 54321;
+
+    /// <summary>
+    /// Tests TCP handshake (SYN, SYN-ACK, ACK) using the LocalTcpStack
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public async Task TcpHandshake_ShouldComplete()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Act - Send SYN packet
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+
+        // Assert - Should receive SYN-ACK
+        Assert.AreEqual(1, sentPackets.Count, "Should send SYN-ACK");
+        var synAckPacket = sentPackets[0];
+        var synAckTcp = synAckPacket.ExtractTcp();
+        Assert.IsTrue(synAckTcp.Synchronize, "SYN-ACK should have SYN flag");
+        Assert.IsTrue(synAckTcp.Acknowledgment, "SYN-ACK should have ACK flag");
+        Assert.AreEqual(1001u, synAckTcp.AcknowledgmentNumber, "ACK number should be SYN seq + 1");
+
+        // Act - Send final ACK to complete handshake
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, 
+            ack: true, seq: 1001, ackNum: synAckTcp.SequenceNumber + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        // Assert - Connection should be accepted
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        var stream = await acceptTask.WaitAsync(cts.Token);
+        Assert.IsNotNull(stream, "Stream should be accepted after handshake");
+        await stream.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Tests data transfer through LocalTcpStack
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public async Task DataTransfer_ShouldSucceed()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Complete handshake
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+        
+        var synAckTcp = sentPackets[0].ExtractTcp();
+        var serverSeq = synAckTcp.SequenceNumber;
+        
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        var stream = await acceptTask.WaitAsync(cts.Token);
+        sentPackets.Clear();
+
+        // Act - Send data from client to server
+        var testData = new byte[] { 0x48, 0x65, 0x6C, 0x6C, 0x6F }; // "Hello"
+        var dataPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
+        tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
+
+        // Assert - Should receive data ACK
+        Assert.IsTrue(sentPackets.Count >= 1, "Should send ACK for data");
+        
+        // Read data from stream
+        var buffer = new byte[100];
+        var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cts.Token);
+        
+        Assert.AreEqual(5, bytesRead, "Should read 5 bytes");
+        CollectionAssert.AreEqual(testData, buffer.Take(bytesRead).ToArray(), "Data should match");
+
+        await stream.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Tests server writing data back to client
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public async Task ServerWrite_ShouldSendPacket()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Complete handshake
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+        
+        var synAckTcp = sentPackets[0].ExtractTcp();
+        var serverSeq = synAckTcp.SequenceNumber;
+        
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+        var stream = await acceptTask.WaitAsync(cts.Token);
+        sentPackets.Clear();
+
+        // Act - Server writes data
+        var responseData = new byte[] { 0x57, 0x6F, 0x72, 0x6C, 0x64 }; // "World"
+        await stream.WriteAsync(responseData, 0, responseData.Length, cts.Token);
+        
+        // Give time for async packet emission
+        await Task.Delay(100);
+
+        // Assert - Should send data packet
+        Assert.IsTrue(sentPackets.Count >= 1, "Should send data packet");
+        var dataPacket = sentPackets.First(p => p.ExtractTcp().Payload.Length > 0);
+        var dataTcp = dataPacket.ExtractTcp();
+        
+        Assert.IsTrue(dataTcp.Acknowledgment, "Data packet should have ACK flag");
+        Assert.IsTrue(dataTcp.Push, "Data packet should have PSH flag");
+        CollectionAssert.AreEqual(responseData, dataTcp.Payload.ToArray(), "Payload should match");
+
+        await stream.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Tests echo functionality through the TCP stack
+    /// </summary>
+    [TestMethod]
+    [Timeout(10000)]
+    public async Task EchoTest_ShouldSucceed()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        object lockObj = new();
+        tcpStack.OnPacketSend = packet =>
+        {
+            lock (lockObj)
+            {
+                sentPackets.Add(packet);
+            }
+        };
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        
+        // Start echo server
+        var echoServerTask = Task.Run(async () =>
+        {
+            await foreach (var stream in listener.AcceptAllAsync())
+            {
+                var buffer = new byte[1024];
+                while (true)
+                {
+                    var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                    if (bytesRead == 0) break;
+                    await stream.WriteAsync(buffer, 0, bytesRead);
+                }
+                break;
+            }
+        });
+
+        // Complete handshake
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+        
+        IpPacket synAckPacket;
+        lock (lockObj) { synAckPacket = sentPackets[0]; }
+        var synAckTcp = synAckPacket.ExtractTcp();
+        var serverSeq = synAckTcp.SequenceNumber;
+        
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+        
+        await Task.Delay(100); // Wait for accept
+
+        // Act - Send data and check for echo
+        lock (lockObj) { sentPackets.Clear(); }
+        
+        var testData = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05 };
+        var dataPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
+        tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
+        
+        // Wait for echo response
+        await Task.Delay(500);
+        
+        // Assert - Should receive echoed data
+        IpPacket[] packetsSnapshot;
+        lock (lockObj) { packetsSnapshot = sentPackets.ToArray(); }
+        
+        var dataPackets = packetsSnapshot.Where(p => p.ExtractTcp().Payload.Length > 0).ToList();
+        Assert.IsTrue(dataPackets.Count > 0, "Should receive echoed data packet");
+        
+        var echoedData = dataPackets[0].ExtractTcp().Payload.ToArray();
+        CollectionAssert.AreEqual(testData, echoedData, "Echoed data should match sent data");
+    }
+
+    /// <summary>
+    /// Tests larger data transfer (multiple packets)
+    /// </summary>
+    [TestMethod]
+    [Timeout(10000)]
+    public async Task LargeDataTransfer_ShouldSucceed()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        object lockObj = new();
+        tcpStack.OnPacketSend = packet =>
+        {
+            lock (lockObj)
+            {
+                sentPackets.Add(packet);
+            }
+        };
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Complete handshake
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+        
+        IpPacket synAckPacket;
+        lock (lockObj) { synAckPacket = sentPackets[0]; }
+        var synAckTcp = synAckPacket.ExtractTcp();
+        var serverSeq = synAckTcp.SequenceNumber;
+        
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var stream = await acceptTask.WaitAsync(cts.Token);
+
+        // Act - Send 1KB of data
+        var testData = new byte[1024];
+        RandomNumberGenerator.Fill(testData);
+        
+        var dataPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
+        tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
+
+        // Read data from stream
+        var received = new List<byte>();
+        var buffer = new byte[256];
+        
+        while (received.Count < testData.Length)
+        {
+            var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cts.Token);
+            if (bytesRead == 0) break;
+            received.AddRange(buffer.Take(bytesRead));
+        }
+
+        // Assert
+        Assert.AreEqual(testData.Length, received.Count, "Should receive all data");
+        CollectionAssert.AreEqual(testData, received.ToArray(), "Data should match");
+
+        await stream.DisposeAsync();
+    }
+
+    private static async Task<LocalTcpStream> AcceptConnectionAsync(LocalTcpListener listener)
+    {
+        await foreach (var stream in listener.AcceptAllAsync())
+        {
+            return stream;
+        }
+        throw new InvalidOperationException("No connection accepted");
+    }
+
+    private static IpPacket CreateTcpPacket(
+        IPAddress srcIp, int srcPort,
+        IPAddress dstIp, int dstPort,
+        bool syn = false, bool ack = false, bool fin = false, bool psh = false, bool rst = false,
+        uint seq = 0, uint ackNum = 0,
+        byte[]? payload = null)
+    {
+        var packet = PacketBuilder.BuildTcp(
+            new IPEndPoint(srcIp, srcPort),
+            new IPEndPoint(dstIp, dstPort),
+            ReadOnlySpan<byte>.Empty,
+            payload ?? ReadOnlySpan<byte>.Empty);
+        
+        var tcp = packet.ExtractTcp();
+        tcp.Synchronize = syn;
+        tcp.Acknowledgment = ack;
+        tcp.Finish = fin;
+        tcp.Push = psh;
+        tcp.Reset = rst;
+        tcp.SequenceNumber = seq;
+        tcp.AcknowledgmentNumber = ackNum;
+        
+        packet.UpdateAllChecksums();
+        return packet;
+    }
+
+    private static byte[] GenerateRandomTestData(int size)
+    {
+        var data = new byte[size];
+        RandomNumberGenerator.Fill(data);
+        return data;
+    }
+}

@@ -36,11 +36,18 @@ TCP listener that accepts incoming connections, similar to `TcpListener`.
 ```csharp
 var listener = tcpStack.Listen(new IPEndPoint(IPAddress.Loopback, 8080));
 
+// Accept a single connection
+var stream = await listener.AcceptAsync();
+
+// Or accept all connections using async enumerable
 await foreach (var stream in listener.AcceptAllAsync())
 {
     // Handle new connection
     _ = Task.Run(() => HandleConnection(stream));
 }
+
+// Stop listening
+listener.Stop();
 ```
 
 ### LocalTcpStream
@@ -154,7 +161,7 @@ The TCP stack uses the following flow:
 
 ## Dependencies
 
-- .NET 8.0+
+- .NET 10.0+
 - VpnHood.Core.Packets
 - System.Threading.Channels
 - System.IO.Pipelines
