@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Threading.Channels;
+using VpnHood.Core.TcpStack.Primitives;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -26,9 +27,9 @@ public sealed class LocalTcpListener
         LocalEndPoint = localEndPoint;
     }
 
-    internal void EnqueueAccept(LocalTcpConnection conn)
+    internal void EnqueueAccept(LocalTcpConnection connection)
     {
-        var stream = new LocalTcpStream(conn, _stack);
+        var stream = new LocalTcpStream(connection, _stack);
         _acceptQueue.Writer.TryWrite(stream);
     }
 
@@ -37,7 +38,10 @@ public sealed class LocalTcpListener
     /// </summary>
     /// <param name="ct">Cancellation token to stop accepting connections.</param>
     /// <returns>An async enumerable of connected streams.</returns>
-    public IAsyncEnumerable<LocalTcpStream> AcceptAllAsync(CancellationToken ct = default) => _acceptQueue.Reader.ReadAllAsync(ct);
+    public IAsyncEnumerable<LocalTcpStream> AcceptAllAsync(CancellationToken ct = default)
+    {
+        return _acceptQueue.Reader.ReadAllAsync(ct);
+    }
 
     /// <summary>
     /// Asynchronously accepts a single incoming connection.

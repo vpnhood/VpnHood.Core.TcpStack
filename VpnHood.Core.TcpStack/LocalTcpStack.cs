@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Security.Cryptography;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
+using VpnHood.Core.TcpStack.Primitives;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -79,7 +81,7 @@ public sealed class LocalTcpStack
         if (!_listeners.TryGetValue(dstEndPoint, out var listener))
             return;
 
-        var isnLocal = TcpUtil.NewIsn();
+        var isnLocal = (uint)RandomNumberGenerator.GetInt32(int.MaxValue);
         var conn = new LocalTcpConnection(quad, isnLocal, tcpPacket.SequenceNumber);
 
         if (!_connections.TryAdd(quad, conn))
@@ -110,8 +112,8 @@ public sealed class LocalTcpStack
     private void HandleExistingConnection(LocalTcpConnection conn, TcpPacket tcpPacket, IPEndPoint dstEndPoint, IPEndPoint srcEndPoint)
     {
         // Transition from SynReceived to Established on first ACK
-        if (conn.State == TcpConnState.SynReceived && tcpPacket.Acknowledgment)
-            conn.State = TcpConnState.Established;
+        if (conn.State == TcpConnectionState.SynReceived && tcpPacket.Acknowledgment)
+            conn.State = TcpConnectionState.Established;
 
         var flags = (TcpFlags)0;
         if (tcpPacket.Finish) flags |= TcpFlags.Fin;

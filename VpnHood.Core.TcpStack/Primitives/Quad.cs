@@ -1,6 +1,6 @@
 using System.Net;
 
-namespace VpnHood.Core.TcpStack;
+namespace VpnHood.Core.TcpStack.Primitives;
 
 internal readonly record struct Quad(IPEndPoint Source, IPEndPoint Destination)
 {

@@ -1,53 +1,57 @@
-using System.Threading.Channels;
+using System.Buffers;
+using System.IO.Pipelines;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
+using VpnHood.Core.TcpStack.Primitives;
 
 namespace VpnHood.Core.TcpStack;
 
-internal enum TcpConnState
+internal sealed class LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemote) : IDisposable
 {
-    SynReceived,
-    Established,
-    FinWait1,
-    Closing,
-    Closed
-}
-
-internal sealed class LocalTcpConnection : IDisposable
-{
-    private readonly Channel<byte[]> _appToNet = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
-    private readonly Channel<byte[]> _netToApp = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleWriter = true });
-    private readonly object _lock = new();
+    private readonly Pipe _netToAppPipe = new(new PipeOptions(useSynchronizationContext: false));
+    private readonly Lock _lock = new();
     private bool _finSent;
-    
-    public Quad Quad { get; }
-    internal uint SndNxt { get; set; }
-    public uint RcvNxt { get; private set; }
-    public TcpConnState State { get; internal set; }
+    private bool _disposed;
+
+    // Pipe for app -> network data (stream writes)
+    private readonly Pipe _appToNetPipe = new(new PipeOptions(useSynchronizationContext: false));
+    // Pipe for network -> app data (stream reads)
+
+    public Quad Quad { get; } = quad;
+    internal uint SndNxt { get; set; } = isnLocal;
+    public uint RcvNxt { get; private set; } = isnRemote + 1; // expecting after SYN
+    public TcpConnectionState State { get; internal set; } = TcpConnectionState.SynReceived;
     public CancellationToken ConnectionClosed => _cts.Token;
     private readonly CancellationTokenSource _cts = new();
     
-    public LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemote)
-    {
-        Quad = quad;
-        SndNxt = isnLocal;
-        RcvNxt = isnRemote + 1; // expecting after SYN
-        State = TcpConnState.SynReceived;
-    }
+    /// <summary>
+    /// PipeReader for reading data received from network (used by LocalTcpStream)
+    /// </summary>
+    public PipeReader NetToAppReader => _netToAppPipe.Reader;
 
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+        
         if (!_cts.IsCancellationRequested)
             _cts.Cancel();
         _cts.Dispose();
     }
 
-    public ValueTask SendAppDataAsync(byte[] data, CancellationToken ct = default)
+    /// <summary>
+    /// Writes data from app to the network pipe (zero-copy when possible)
+    /// </summary>
+    public async ValueTask SendAppDataAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
-        return _appToNet.Writer.WriteAsync(data, ct);
+        var result = await _appToNetPipe.Writer.WriteAsync(data, ct);
+        if (result.IsCompleted || result.IsCanceled)
+            return;
     }
-    public IAsyncEnumerable<byte[]> ReadAppDataAsync(CancellationToken ct = default) => _netToApp.Reader.ReadAllAsync(ct);
 
+    /// <summary>
+    /// Handles incoming TCP data from network - writes directly to pipe without allocation
+    /// </summary>
     public bool TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload, LocalTcpStack stack)
     {
         if (flags.HasFlag(TcpFlags.Rst)) { Close(); return false; }
@@ -56,33 +60,58 @@ internal sealed class LocalTcpConnection : IDisposable
         if (payload.Length > 0)
         {
             RcvNxt += (uint)payload.Length;
-            _netToApp.Writer.TryWrite(payload.ToArray());
+            
+            // Write directly to pipe - uses pooled memory
+            var span = _netToAppPipe.Writer.GetSpan(payload.Length);
+            payload.CopyTo(span);
+            _netToAppPipe.Writer.Advance(payload.Length);
+            
+            // Flush synchronously since we're in the packet processing path
+            var flushTask = _netToAppPipe.Writer.FlushAsync();
+            if (!flushTask.IsCompleted)
+                flushTask.AsTask().GetAwaiter().GetResult();
         }
         
         if (flags.HasFlag(TcpFlags.Fin))
         {
             RcvNxt += 1;
-            _netToApp.Writer.Complete();
-            State = TcpConnState.Closing;
+            _netToAppPipe.Writer.Complete();
+            State = TcpConnectionState.Closing;
         }
         return true;
     }
 
+    /// <summary>
+    /// Reads from app pipe and emits TCP packets to the network
+    /// </summary>
     public async Task EmitPendingAsync(LocalTcpStack stack, CancellationToken ct)
     {
+        var reader = _appToNetPipe.Reader;
         try
         {
-            while (State != TcpConnState.Closed && await _appToNet.Reader.WaitToReadAsync(ct))
+            while (State != TcpConnectionState.Closed)
             {
-                while (_appToNet.Reader.TryRead(out var data))
+                var result = await reader.ReadAsync(ct);
+                var buffer = result.Buffer;
+                
+                if (buffer.IsEmpty)
                 {
-                    if (data.Length == 0) continue;
+                    if (result.IsCompleted)
+                        break;
+                    reader.AdvanceTo(buffer.End);
+                    continue;
+                }
+
+                // Process all available data in one go
+                foreach (var segment in buffer)
+                {
+                    if (segment.IsEmpty) continue;
                     
-                    // Create TCP packet using PacketBuilder
+                    // Create TCP packet directly from the segment span
                     var tcpPacket = PacketBuilder.BuildTcp(
                         Quad.Destination, Quad.Source, // reversed because quad stored original SYN direction
                         ReadOnlySpan<byte>.Empty, // no options
-                        data);
+                        segment.Span);
                     
                     var tcp = tcpPacket.ExtractTcp();
                     tcp.SequenceNumber = SndNxt;
@@ -91,19 +120,30 @@ internal sealed class LocalTcpConnection : IDisposable
                     tcp.Push = true;
                     tcp.WindowSize = 65535; // Advertise large receive window
                     
-                    SndNxt += (uint)data.Length;
+                    SndNxt += (uint)segment.Length;
                     stack.SendPacket(tcpPacket);
                 }
                 
-                if (_finSent && State == TcpConnState.Closing)
+                // Mark all data as consumed
+                reader.AdvanceTo(buffer.End);
+                
+                if (_finSent && State == TcpConnectionState.Closing)
                 {
                     Close();
+                    break;
                 }
+                
+                if (result.IsCompleted)
+                    break;
             }
         }
         catch (OperationCanceledException)
         {
             // Expected when connection is closed
+        }
+        finally
+        {
+            await reader.CompleteAsync();
         }
     }
 
@@ -113,6 +153,9 @@ internal sealed class LocalTcpConnection : IDisposable
         {
             if (_finSent) return;
             _finSent = true;
+            
+            // Complete the app->net pipe to signal no more data
+            _appToNetPipe.Writer.Complete();
             
             var tcpPacket = PacketBuilder.BuildTcp(
                 Quad.Destination, Quad.Source,
@@ -133,9 +176,9 @@ internal sealed class LocalTcpConnection : IDisposable
 
     private void Close()
     {
-        State = TcpConnState.Closed;
-        _netToApp.Writer.TryComplete();
-        _appToNet.Writer.TryComplete();
+        State = TcpConnectionState.Closed;
+        _netToAppPipe.Writer.Complete();
+        _appToNetPipe.Writer.Complete();
         Dispose();
     }
 }

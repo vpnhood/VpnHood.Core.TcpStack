@@ -1,4 +1,4 @@
-namespace VpnHood.Core.TcpStack;
+namespace VpnHood.Core.TcpStack.Primitives;
 
 [Flags]
 internal enum TcpFlags : byte
