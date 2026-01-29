@@ -1,6 +1,6 @@
+using Microsoft.Extensions.Logging;
 using System.Diagnostics;
 using System.IO.Pipelines;
-using Microsoft.Extensions.Logging;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.TcpStack.Primitives;
@@ -10,7 +10,7 @@ using VpnHood.Core.Toolkit.Utils;
 namespace VpnHood.Core.TcpStack;
 
 internal sealed class LocalTcpConnection(
-    Quad quad, uint isnLocal, uint isnRemote, TimeSpan? tcpTimeout = null) : IDisposable
+    IpEndPointQuad ipEndPointQuad, uint isnLocal, uint isnRemote, TimeSpan? tcpTimeout = null) : IDisposable
 {
     // For loopback, we use a moderate fixed window size.
     // The pipe's internal backpressure handles flow control.
@@ -43,7 +43,7 @@ internal sealed class LocalTcpConnection(
     private bool _netToAppCompleted;
     private bool _appToNetCompleted;
 
-    public Quad Quad { get; } = quad;
+    public IpEndPointQuad IpEndPointQuad { get; } = ipEndPointQuad;
     internal uint SndNxt { get; set; } = isnLocal;
     public uint RcvNxt { get; private set; } = isnRemote + 1; // expecting after SYN
     public TcpConnectionState State { get; internal set; } = TcpConnectionState.SynReceived;
@@ -250,7 +250,7 @@ internal sealed class LocalTcpConnection(
                         continue;
 
                     var tcpPacket = PacketBuilder.BuildTcp(
-                        Quad.Destination, Quad.Source,
+                        IpEndPointQuad.Destination, IpEndPointQuad.Source,
                         ReadOnlySpan<byte>.Empty,
                         segment.Span);
 
@@ -277,7 +277,7 @@ internal sealed class LocalTcpConnection(
         catch (Exception)
         {
             // Log exception if needed
-            VhLogger.Instance.LogError("Exception in EmitPendingAsync for connection {0}", Quad);
+            VhLogger.Instance.LogError("Exception in EmitPendingAsync for connection {0}", IpEndPointQuad);
         }
         finally
         {
@@ -295,7 +295,7 @@ internal sealed class LocalTcpConnection(
             CompleteAppToNet();
 
             var tcpPacket = PacketBuilder.BuildTcp(
-                Quad.Destination, Quad.Source,
+                IpEndPointQuad.Destination, IpEndPointQuad.Source,
                 ReadOnlySpan<byte>.Empty,
                 ReadOnlySpan<byte>.Empty);
 
