@@ -48,7 +48,6 @@ public sealed class LocalTcpStack
         try
         {
             var ipPacket = PacketBuilder.Parse(packetData);
-
             if (ipPacket.Protocol != IpProtocol.Tcp)
                 return;
 
