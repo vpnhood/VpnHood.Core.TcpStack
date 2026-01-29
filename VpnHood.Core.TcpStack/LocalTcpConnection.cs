@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Pipelines;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
@@ -13,6 +14,8 @@ internal sealed class LocalTcpConnection(
     // The pipe's internal backpressure handles flow control.
     // Large windows waste memory since transfers are instant in loopback.
     private const ushort LoopbackWindowSize = 16384;
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromMinutes(60);
     
     // Pipe options - moderate buffer for loopback (no need for large buffers)
     private static readonly PipeOptions PipeOpts = new(
@@ -30,6 +33,8 @@ internal sealed class LocalTcpConnection(
     private bool _finSent;
     private bool _finReceived;
     private bool _disposed;
+    private int _closedFlag;
+    private long _lastActivityTicks;
 
     public Quad Quad { get; } = quad;
     internal uint SndNxt { get; set; } = isnLocal;
@@ -64,6 +69,7 @@ internal sealed class LocalTcpConnection(
     public async ValueTask SendAppDataAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
         if (_disposed) return;
+        Touch();
         await _appToNetPipe.Writer.WriteAsync(data, ct);
     }
 
@@ -74,6 +80,7 @@ internal sealed class LocalTcpConnection(
     public (bool handled, bool needsAck) TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload)
     {
         if (_disposed) return (false, false);
+        Touch();
         
         if (flags.HasFlag(TcpFlags.Rst)) 
         { 
@@ -150,6 +157,37 @@ internal sealed class LocalTcpConnection(
         if (!flushTask.IsCompleted)
         {
             _ = flushTask.AsTask().ContinueWith(_ => { }, TaskContinuationOptions.OnlyOnFaulted);
+        }
+    }
+
+    private void Touch()
+    {
+        Interlocked.Exchange(ref _lastActivityTicks, Stopwatch.GetTimestamp());
+    }
+
+    // todo: not used yet
+    private async Task MonitorIdleAsync()
+    {
+        using var timer = new PeriodicTimer(IdleCheckInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(_cts.Token))
+            {
+                if (_disposed || State == TcpConnectionState.Closed)
+                    break;
+
+                var last = Interlocked.Read(ref _lastActivityTicks);
+                var elapsed = Stopwatch.GetElapsedTime(last);
+                if (elapsed >= IdleTimeout)
+                {
+                    Close();
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on disposal/close
         }
     }
 
@@ -248,12 +286,13 @@ internal sealed class LocalTcpConnection(
 
     private void Close()
     {
-        if (State == TcpConnectionState.Closed && !_disposed)
-        {
-            _netToAppPipe.Writer.Complete();
-            _appToNetPipe.Writer.Complete();
-            OnClosed?.Invoke(this);
-            Dispose();
-        }
+        if (Interlocked.Exchange(ref _closedFlag, 1) != 0)
+            return;
+
+        State = TcpConnectionState.Closed;
+        _netToAppPipe.Writer.Complete();
+        _appToNetPipe.Writer.Complete();
+        OnClosed?.Invoke(this);
+        Dispose();
     }
 }
