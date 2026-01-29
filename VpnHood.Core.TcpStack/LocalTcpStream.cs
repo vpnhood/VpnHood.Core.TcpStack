@@ -61,7 +61,7 @@ public sealed class LocalTcpStream : Stream
         var reader = _connection.NetToAppReader;
         var readResult = await reader.ReadAsync(combinedCts.Token);
 
-        if (readResult.IsCanceled || (readResult.IsCompleted && readResult.Buffer.IsEmpty))
+        if (readResult.IsCanceled || readResult is { IsCompleted: true, Buffer.IsEmpty: true })
             return 0;
 
         var bytesToCopy = (int)Math.Min(buffer.Length, readResult.Buffer.Length);

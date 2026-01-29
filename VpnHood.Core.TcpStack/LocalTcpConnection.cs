@@ -5,7 +5,9 @@ using VpnHood.Core.TcpStack.Primitives;
 
 namespace VpnHood.Core.TcpStack;
 
-internal sealed class LocalTcpConnection : IDisposable
+internal sealed class LocalTcpConnection(
+    Quad quad, uint isnLocal, uint isnRemote) 
+    : IDisposable
 {
     // For loopback, we use a moderate fixed window size.
     // The pipe's internal backpressure handles flow control.
@@ -29,9 +31,9 @@ internal sealed class LocalTcpConnection : IDisposable
     private bool _finReceived;
     private bool _disposed;
 
-    public Quad Quad { get; }
-    internal uint SndNxt { get; set; }
-    public uint RcvNxt { get; private set; }
+    public Quad Quad { get; } = quad;
+    internal uint SndNxt { get; set; } = isnLocal;
+    public uint RcvNxt { get; private set; } = isnRemote + 1; // expecting after SYN
     public TcpConnectionState State { get; internal set; } = TcpConnectionState.SynReceived;
     public CancellationToken ConnectionClosed => _cts.Token;
     private readonly CancellationTokenSource _cts = new();
@@ -45,13 +47,6 @@ internal sealed class LocalTcpConnection : IDisposable
     /// PipeReader for reading data received from network (used by LocalTcpStream)
     /// </summary>
     public PipeReader NetToAppReader => _netToAppPipe.Reader;
-
-    public LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemote)
-    {
-        Quad = quad;
-        SndNxt = isnLocal;
-        RcvNxt = isnRemote + 1; // expecting after SYN
-    }
 
     public void Dispose()
     {
@@ -94,16 +89,16 @@ internal sealed class LocalTcpConnection : IDisposable
             // Retransmission - ACK it but don't duplicate data
             // Check for partial overlap with new data
             var retransmitEnd = seq + (uint)payload.Length;
-            if (retransmitEnd > RcvNxt && payload.Length > 0)
-            {
-                var overlap = (int)(RcvNxt - seq);
-                var newData = payload.Slice(overlap);
-                if (newData.Length > 0)
-                {
-                    WriteToAppPipe(newData);
-                    RcvNxt += (uint)newData.Length;
-                }
-            }
+            if (retransmitEnd <= RcvNxt || payload.Length <= 0) 
+                return (true, true); // ACK retransmissions
+
+            var overlap = (int)(RcvNxt - seq);
+            var newData = payload[overlap..];
+            if (newData.Length <= 0) 
+                return (true, true); // ACK retransmissions
+
+            WriteToAppPipe(newData);
+            RcvNxt += (uint)newData.Length;
             return (true, true); // ACK retransmissions
         }
         
@@ -151,7 +146,7 @@ internal sealed class LocalTcpConnection : IDisposable
         _netToAppPipe.Writer.Advance(data.Length);
         
         // Fire-and-forget flush - pipe backpressure handles flow control
-        var flushTask = _netToAppPipe.Writer.FlushAsync();
+        var flushTask = _netToAppPipe.Writer.FlushAsync(ConnectionClosed);
         if (!flushTask.IsCompleted)
         {
             _ = flushTask.AsTask().ContinueWith(_ => { }, TaskContinuationOptions.OnlyOnFaulted);

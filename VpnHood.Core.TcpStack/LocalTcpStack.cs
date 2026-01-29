@@ -29,7 +29,7 @@ public sealed class LocalTcpStack
     /// </summary>
     public LocalTcpListener Listen(IPEndPoint localEndPoint)
     {
-        return _listeners.GetOrAdd(localEndPoint, ep => new LocalTcpListener(this, ep, _connections));
+        return _listeners.GetOrAdd(localEndPoint, ep => new LocalTcpListener(this, ep));
     }
 
     /// <summary>

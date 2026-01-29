@@ -1,7 +1,5 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Threading.Channels;
-using VpnHood.Core.TcpStack.Primitives;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -21,7 +19,7 @@ public sealed class LocalTcpListener
     /// </summary>
     public IPEndPoint LocalEndPoint { get; }
 
-    internal LocalTcpListener(LocalTcpStack stack, IPEndPoint localEndPoint, ConcurrentDictionary<Quad, LocalTcpConnection> connections)
+    internal LocalTcpListener(LocalTcpStack stack, IPEndPoint localEndPoint)
     {
         _stack = stack;
         LocalEndPoint = localEndPoint;
