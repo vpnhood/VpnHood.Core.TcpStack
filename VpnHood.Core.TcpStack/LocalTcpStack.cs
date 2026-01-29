@@ -92,6 +92,29 @@ public sealed class LocalTcpStack
             return;
         }
 
+        // Check if connection already exists (SYN retransmit)
+        if (_connections.TryGetValue(quad, out var existingConn))
+        {
+            // SYN retransmit - resend SYN-ACK
+            if (existingConn.State == TcpConnectionState.SynReceived)
+            {
+                var synAckPacket = PacketBuilder.BuildTcp(
+                    dstEndPoint, srcEndPoint,
+                    ReadOnlySpan<byte>.Empty,
+                    ReadOnlySpan<byte>.Empty);
+
+                var synAckTcp = synAckPacket.ExtractTcp();
+                synAckTcp.SequenceNumber = existingConn.SndNxt - 1; // SYN seq was SndNxt - 1
+                synAckTcp.AcknowledgmentNumber = existingConn.RcvNxt;
+                synAckTcp.Synchronize = true;
+                synAckTcp.Acknowledgment = true;
+                synAckTcp.WindowSize = LoopbackWindowSize;
+
+                SendPacket(synAckPacket);
+            }
+            return;
+        }
+
         var isnLocal = (uint)RandomNumberGenerator.GetInt32(int.MaxValue);
         var conn = new LocalTcpConnection(quad, isnLocal, tcpPacket.SequenceNumber);
         
@@ -99,28 +122,31 @@ public sealed class LocalTcpStack
         conn.OnClosed += OnConnectionClosed;
 
         if (!_connections.TryAdd(quad, conn))
+        {
+            conn.Dispose();
             return;
+        }
 
         listener.EnqueueAccept(conn);
 
         // Send SYN-ACK
-        var synAckPacket = PacketBuilder.BuildTcp(
+        var synAckPacket2 = PacketBuilder.BuildTcp(
             dstEndPoint, srcEndPoint,
             ReadOnlySpan<byte>.Empty,
             ReadOnlySpan<byte>.Empty);
 
-        var synAckTcp = synAckPacket.ExtractTcp();
-        synAckTcp.SequenceNumber = isnLocal;
-        synAckTcp.AcknowledgmentNumber = tcpPacket.SequenceNumber + 1;
-        synAckTcp.Synchronize = true;
-        synAckTcp.Acknowledgment = true;
-        synAckTcp.WindowSize = LoopbackWindowSize;
+        var synAckTcp2 = synAckPacket2.ExtractTcp();
+        synAckTcp2.SequenceNumber = isnLocal;
+        synAckTcp2.AcknowledgmentNumber = tcpPacket.SequenceNumber + 1;
+        synAckTcp2.Synchronize = true;
+        synAckTcp2.Acknowledgment = true;
+        synAckTcp2.WindowSize = LoopbackWindowSize;
 
-        SendPacket(synAckPacket);
+        SendPacket(synAckPacket2);
         conn.SndNxt += 1; // SYN counts as one sequence number
 
-        // Start the connection's data pump
-        _ = Task.Run(() => conn.EmitPendingAsync(this, CancellationToken.None));
+        // Start background tasks (idle monitor, data pump)
+        conn.Start(this);
     }
 
     private void HandleExistingConnection(LocalTcpConnection conn, TcpPacket tcpPacket, IPEndPoint dstEndPoint, IPEndPoint srcEndPoint)

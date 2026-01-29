@@ -7,12 +7,13 @@ namespace VpnHood.Core.TcpStack;
 /// TCP listener that accepts incoming connections on a local endpoint.
 /// Similar to <see cref="System.Net.Sockets.TcpListener"/> but for the local TCP stack.
 /// </summary>
-public sealed class LocalTcpListener
+public sealed class LocalTcpListener : IDisposable
 {
     private readonly Channel<LocalTcpStream> _acceptQueue = Channel.CreateUnbounded<LocalTcpStream>(
         new UnboundedChannelOptions { SingleReader = true });
 
     private readonly LocalTcpStack _stack;
+    private bool _stopped;
 
     /// <summary>
     /// The local endpoint this listener is bound to.
@@ -27,8 +28,14 @@ public sealed class LocalTcpListener
 
     internal void EnqueueAccept(LocalTcpConnection connection)
     {
+        if (_stopped) return;
+        
         var stream = new LocalTcpStream(connection, _stack);
-        _acceptQueue.Writer.TryWrite(stream);
+        if (!_acceptQueue.Writer.TryWrite(stream))
+        {
+            // Queue was completed, dispose the stream
+            stream.Dispose();
+        }
     }
 
     /// <summary>
@@ -56,7 +63,22 @@ public sealed class LocalTcpListener
     /// </summary>
     public void Stop()
     {
+        if (_stopped) return;
+        _stopped = true;
+        
         _acceptQueue.Writer.TryComplete();
         _stack.StopListening(LocalEndPoint);
+        
+        // Dispose any unaccepted streams
+        while (_acceptQueue.Reader.TryRead(out var stream))
+        {
+            stream.Dispose();
+        }
+    }
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        Stop();
     }
 }

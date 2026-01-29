@@ -11,7 +11,7 @@ public sealed class LocalTcpStream : Stream
     private readonly LocalTcpConnection _connection;
     private readonly LocalTcpStack _stack;
     private readonly CancellationTokenSource _cts = new();
-    private bool _disposed;
+    private int _disposed;
 
     internal LocalTcpStream(LocalTcpConnection connection, LocalTcpStack stack)
     {
@@ -19,11 +19,13 @@ public sealed class LocalTcpStream : Stream
         _stack = stack;
     }
 
-    /// <inheritdoc />
-    public override bool CanRead => !_disposed;
+    private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
 
     /// <inheritdoc />
-    public override bool CanWrite => !_disposed;
+    public override bool CanRead => !IsDisposed;
+
+    /// <inheritdoc />
+    public override bool CanWrite => !IsDisposed;
 
     /// <inheritdoc />
     public override bool CanSeek => false;
@@ -53,25 +55,31 @@ public sealed class LocalTcpStream : Stream
     /// <inheritdoc />
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
 
-        using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+        // Avoid allocating linked CTS when possible
+        var ct = cancellationToken.CanBeCanceled 
+            ? CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken).Token 
+            : _cts.Token;
 
-        // Read directly from the connection's pipe - no intermediate buffer
-        var reader = _connection.NetToAppReader;
-        var readResult = await reader.ReadAsync(combinedCts.Token);
+        try
+        {
+            var reader = _connection.NetToAppReader;
+            var readResult = await reader.ReadAsync(ct);
 
-        if (readResult.IsCanceled || readResult is { IsCompleted: true, Buffer.IsEmpty: true })
+            if (readResult.IsCanceled || readResult is { IsCompleted: true, Buffer.IsEmpty: true })
+                return 0;
+
+            var bytesToCopy = (int)Math.Min(buffer.Length, readResult.Buffer.Length);
+            readResult.Buffer.Slice(0, bytesToCopy).CopyTo(buffer.Span);
+            reader.AdvanceTo(readResult.Buffer.GetPosition(bytesToCopy));
+            
+            return bytesToCopy;
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        {
             return 0;
-
-        var bytesToCopy = (int)Math.Min(buffer.Length, readResult.Buffer.Length);
-
-        // Copy directly from ReadOnlySequence to destination span
-        readResult.Buffer.Slice(0, bytesToCopy).CopyTo(buffer.Span);
-
-        reader.AdvanceTo(readResult.Buffer.GetPosition(bytesToCopy));
-        
-        return bytesToCopy;
+        }
     }
 
     /// <inheritdoc />
@@ -89,12 +97,20 @@ public sealed class LocalTcpStream : Stream
     /// <inheritdoc />
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
 
-        using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+        var ct = cancellationToken.CanBeCanceled 
+            ? CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken).Token 
+            : _cts.Token;
 
-        // Write directly to the connection's pipe - zero copy
-        await _connection.SendAppDataAsync(buffer, combinedCts.Token);
+        try
+        {
+            await _connection.SendAppDataAsync(buffer, ct);
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        {
+            // Stream disposed
+        }
     }
 
     /// <inheritdoc />
@@ -112,13 +128,28 @@ public sealed class LocalTcpStream : Stream
     /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
-        if (!_disposed && disposing)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+            
+        if (disposing)
         {
-            _disposed = true;
             _cts.Cancel();
             _connection.StartFin(_stack);
             _cts.Dispose();
         }
         base.Dispose(disposing);
+    }
+
+    /// <inheritdoc />
+    public override async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        await _cts.CancelAsync();
+        _connection.StartFin(_stack);
+        _cts.Dispose();
+        
+        GC.SuppressFinalize(this);
     }
 }

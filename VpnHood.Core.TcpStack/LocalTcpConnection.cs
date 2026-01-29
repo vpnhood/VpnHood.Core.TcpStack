@@ -6,16 +6,16 @@ using VpnHood.Core.TcpStack.Primitives;
 
 namespace VpnHood.Core.TcpStack;
 
-internal sealed class LocalTcpConnection(
-    Quad quad, uint isnLocal, uint isnRemote) 
-    : IDisposable
+internal sealed class LocalTcpConnection : IDisposable
 {
     // For loopback, we use a moderate fixed window size.
     // The pipe's internal backpressure handles flow control.
     // Large windows waste memory since transfers are instant in loopback.
     private const ushort LoopbackWindowSize = 16384;
-    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(10);
-    private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromMinutes(60);
+    
+    // Idle timeout for connections without activity (safety net for loopback)
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromMinutes(1);
     
     // Pipe options - moderate buffer for loopback (no need for large buffers)
     private static readonly PipeOptions PipeOpts = new(
@@ -30,18 +30,20 @@ internal sealed class LocalTcpConnection(
     private readonly Pipe _appToNetPipe = new(PipeOpts);
     
     private readonly Lock _lock = new();
+    private readonly CancellationTokenSource _cts = new();
     private bool _finSent;
     private bool _finReceived;
     private bool _disposed;
     private int _closedFlag;
-    private long _lastActivityTicks;
+    private long _lastActivityTicks = Stopwatch.GetTimestamp();
+    private bool _netToAppCompleted;
+    private bool _appToNetCompleted;
 
-    public Quad Quad { get; } = quad;
-    internal uint SndNxt { get; set; } = isnLocal;
-    public uint RcvNxt { get; private set; } = isnRemote + 1; // expecting after SYN
+    public Quad Quad { get; }
+    internal uint SndNxt { get; set; }
+    public uint RcvNxt { get; private set; }
     public TcpConnectionState State { get; internal set; } = TcpConnectionState.SynReceived;
     public CancellationToken ConnectionClosed => _cts.Token;
-    private readonly CancellationTokenSource _cts = new();
     
     /// <summary>
     /// Event raised when connection is fully closed and should be removed from the stack.
@@ -52,6 +54,25 @@ internal sealed class LocalTcpConnection(
     /// PipeReader for reading data received from network (used by LocalTcpStream)
     /// </summary>
     public PipeReader NetToAppReader => _netToAppPipe.Reader;
+
+    public LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemote)
+    {
+        Quad = quad;
+        SndNxt = isnLocal;
+        RcvNxt = isnRemote + 1; // expecting after SYN
+    }
+
+    /// <summary>
+    /// Starts background tasks for this connection. Call after adding to connection dictionary.
+    /// </summary>
+    public void Start(LocalTcpStack stack)
+    {
+        // Start idle monitor
+        _ = Task.Run(() => MonitorIdleAsync());
+        
+        // Start the connection's data pump
+        _ = Task.Run(() => EmitPendingAsync(stack));
+    }
 
     public void Dispose()
     {
@@ -68,9 +89,17 @@ internal sealed class LocalTcpConnection(
     /// </summary>
     public async ValueTask SendAppDataAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
-        if (_disposed) return;
+        if (_disposed || _appToNetCompleted) return;
         Touch();
-        await _appToNetPipe.Writer.WriteAsync(data, ct);
+        
+        try
+        {
+            await _appToNetPipe.Writer.WriteAsync(data, ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on close
+        }
     }
 
     /// <summary>
@@ -88,57 +117,60 @@ internal sealed class LocalTcpConnection(
             return (false, false); 
         }
 
-        // Handle sequence number scenarios
-        var seqDiff = (long)seq - RcvNxt;
-        
-        if (seqDiff < 0)
+        lock (_lock) // Protect RcvNxt modifications
         {
-            // Retransmission - ACK it but don't duplicate data
-            // Check for partial overlap with new data
-            var retransmitEnd = seq + (uint)payload.Length;
-            if (retransmitEnd <= RcvNxt || payload.Length <= 0) 
-                return (true, true); // ACK retransmissions
-
-            var overlap = (int)(RcvNxt - seq);
-            var newData = payload[overlap..];
-            if (newData.Length <= 0) 
-                return (true, true); // ACK retransmissions
-
-            WriteToAppPipe(newData);
-            RcvNxt += (uint)newData.Length;
-            return (true, true); // ACK retransmissions
-        }
-        
-        if (seqDiff > 0)
-        {
-            // Out of order - send duplicate ACK to trigger fast retransmit
-            return (true, true);
-        }
-        
-        // seq == RcvNxt - expected packet
-        if (payload.Length > 0)
-        {
-            WriteToAppPipe(payload);
-            RcvNxt += (uint)payload.Length;
-        }
-        
-        if (flags.HasFlag(TcpFlags.Fin))
-        {
-            RcvNxt += 1;
-            _finReceived = true;
-            _netToAppPipe.Writer.Complete();
+            // Handle sequence number scenarios
+            var seqDiff = (long)seq - RcvNxt;
             
-            // Check if both sides have sent FIN
-            if (_finSent)
+            if (seqDiff < 0)
             {
-                State = TcpConnectionState.Closed;
-                Close();
+                // Retransmission - ACK it but don't duplicate data
+                // Check for partial overlap with new data
+                var retransmitEnd = seq + (uint)payload.Length;
+                if (retransmitEnd > RcvNxt && payload.Length > 0)
+                {
+                    var overlap = (int)(RcvNxt - seq);
+                    var newData = payload[overlap..];
+                    if (newData.Length > 0)
+                    {
+                        WriteToAppPipe(newData);
+                        RcvNxt += (uint)newData.Length;
+                    }
+                }
+                return (true, true); // ACK retransmissions
             }
-            else
+            
+            if (seqDiff > 0)
             {
-                State = TcpConnectionState.Closing;
+                // Out of order - send duplicate ACK to trigger fast retransmit
+                return (true, true);
             }
-            return (true, true); // ACK the FIN
+            
+            // seq == RcvNxt - expected packet
+            if (payload.Length > 0)
+            {
+                WriteToAppPipe(payload);
+                RcvNxt += (uint)payload.Length;
+            }
+            
+            if (flags.HasFlag(TcpFlags.Fin))
+            {
+                RcvNxt += 1;
+                _finReceived = true;
+                CompleteNetToApp();
+                
+                // Check if both sides have sent FIN
+                if (_finSent)
+                {
+                    State = TcpConnectionState.Closed;
+                    Close();
+                }
+                else
+                {
+                    State = TcpConnectionState.Closing;
+                }
+                return (true, true); // ACK the FIN
+            }
         }
         
         return (true, payload.Length > 0);
@@ -146,17 +178,24 @@ internal sealed class LocalTcpConnection(
 
     private void WriteToAppPipe(ReadOnlySpan<byte> data)
     {
-        if (_disposed) return;
+        if (_disposed || _netToAppCompleted) return;
         
-        var span = _netToAppPipe.Writer.GetSpan(data.Length);
-        data.CopyTo(span);
-        _netToAppPipe.Writer.Advance(data.Length);
-        
-        // Fire-and-forget flush - pipe backpressure handles flow control
-        var flushTask = _netToAppPipe.Writer.FlushAsync(ConnectionClosed);
-        if (!flushTask.IsCompleted)
+        try
         {
-            _ = flushTask.AsTask().ContinueWith(_ => { }, TaskContinuationOptions.OnlyOnFaulted);
+            var span = _netToAppPipe.Writer.GetSpan(data.Length);
+            data.CopyTo(span);
+            _netToAppPipe.Writer.Advance(data.Length);
+            
+            // Fire-and-forget flush - pipe backpressure handles flow control
+            var flushTask = _netToAppPipe.Writer.FlushAsync();
+            if (!flushTask.IsCompleted)
+            {
+                _ = flushTask.AsTask().ContinueWith(static _ => { }, TaskContinuationOptions.OnlyOnFaulted);
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // Pipe was completed
         }
     }
 
@@ -165,12 +204,11 @@ internal sealed class LocalTcpConnection(
         Interlocked.Exchange(ref _lastActivityTicks, Stopwatch.GetTimestamp());
     }
 
-    // todo: not used yet
     private async Task MonitorIdleAsync()
     {
-        using var timer = new PeriodicTimer(IdleCheckInterval);
         try
         {
+            using var timer = new PeriodicTimer(IdleCheckInterval);
             while (await timer.WaitForNextTickAsync(_cts.Token))
             {
                 if (_disposed || State == TcpConnectionState.Closed)
@@ -194,14 +232,14 @@ internal sealed class LocalTcpConnection(
     /// <summary>
     /// Reads from app pipe and emits TCP packets to the network
     /// </summary>
-    public async Task EmitPendingAsync(LocalTcpStack stack, CancellationToken ct)
+    private async Task EmitPendingAsync(LocalTcpStack stack)
     {
         var reader = _appToNetPipe.Reader;
         try
         {
             while (!_disposed && State != TcpConnectionState.Closed)
             {
-                var result = await reader.ReadAsync(ct);
+                var result = await reader.ReadAsync(_cts.Token);
                 var buffer = result.Buffer;
                 
                 if (buffer.IsEmpty)
@@ -254,7 +292,7 @@ internal sealed class LocalTcpConnection(
             if (_finSent) return;
             _finSent = true;
             
-            _appToNetPipe.Writer.Complete();
+            CompleteAppToNet();
             
             var tcpPacket = PacketBuilder.BuildTcp(
                 Quad.Destination, Quad.Source,
@@ -284,14 +322,28 @@ internal sealed class LocalTcpConnection(
         }
     }
 
+    private void CompleteNetToApp()
+    {
+        if (_netToAppCompleted) return;
+        _netToAppCompleted = true;
+        _netToAppPipe.Writer.Complete();
+    }
+
+    private void CompleteAppToNet()
+    {
+        if (_appToNetCompleted) return;
+        _appToNetCompleted = true;
+        _appToNetPipe.Writer.Complete();
+    }
+
     private void Close()
     {
         if (Interlocked.Exchange(ref _closedFlag, 1) != 0)
             return;
 
         State = TcpConnectionState.Closed;
-        _netToAppPipe.Writer.Complete();
-        _appToNetPipe.Writer.Complete();
+        CompleteNetToApp();
+        CompleteAppToNet();
         OnClosed?.Invoke(this);
         Dispose();
     }
