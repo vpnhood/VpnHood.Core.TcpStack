@@ -323,13 +323,6 @@ public sealed class LocalTcpStackTest
         return packet;
     }
 
-    private static byte[] GenerateRandomTestData(int size)
-    {
-        var data = new byte[size];
-        RandomNumberGenerator.Fill(data);
-        return data;
-    }
-
     /// <summary>
     /// Tests that retransmitted packets are properly ACKed without duplicating data
     /// </summary>
@@ -400,11 +393,11 @@ public sealed class LocalTcpStackTest
     }
 
     /// <summary>
-    /// Tests that window size changes based on buffer consumption
+    /// Tests that window size is fixed for loopback (pipe backpressure handles flow control)
     /// </summary>
     [TestMethod]
     [Timeout(5000)]
-    public async Task WindowSize_ShouldReflectBufferState()
+    public async Task WindowSize_ShouldBeFixedForLoopback()
     {
         // Arrange
         var tcpStack = new LocalTcpStack();
@@ -427,9 +420,10 @@ public sealed class LocalTcpStackTest
         var synAckTcp = synAckPacket.ExtractTcp();
         var serverSeq = synAckTcp.SequenceNumber;
         
-        // Check initial window size (should be full)
+        // Check window size from SYN-ACK
         var initialWindowSize = synAckTcp.WindowSize;
-        Assert.IsTrue(initialWindowSize > 0, "Initial window should be > 0");
+        Assert.IsTrue(initialWindowSize > 0, "Window should be > 0");
+        Assert.AreEqual(16384, initialWindowSize, "Loopback window should be 16384 (fixed)");
         
         var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
             ack: true, seq: 1001, ackNum: serverSeq + 1);
@@ -448,34 +442,14 @@ public sealed class LocalTcpStackTest
         
         await Task.Delay(50);
 
-        // Get window size from ACK
+        // Get window size from ACK - should be same (fixed for loopback)
         IpPacket ackResponse;
         lock (lockObj) { ackResponse = sentPackets.First(p => p.ExtractTcp().Acknowledgment); }
         var windowAfterData = ackResponse.ExtractTcp().WindowSize;
         
-        // Window should be reduced (data buffered but not read)
-        Assert.IsTrue(windowAfterData < initialWindowSize, 
-            $"Window should decrease when data is buffered. Initial: {initialWindowSize}, After: {windowAfterData}");
-
-        // Read all data
-        var buffer = new byte[2000];
-        await stream.ReadAsync(buffer, 0, testData.Length, cts.Token);
-        
-        // Send another packet to get updated window
-        lock (lockObj) sentPackets.Clear();
-        var dataPacket2 = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
-            ack: true, psh: true, seq: 1001 + (uint)testData.Length, ackNum: serverSeq + 1, payload: [0x01]);
-        tcpStack.ProcessIncoming(dataPacket2.Buffer.Span);
-        
-        await Task.Delay(50);
-
-        IpPacket ackResponse2;
-        lock (lockObj) { ackResponse2 = sentPackets.First(p => p.ExtractTcp().Acknowledgment); }
-        var windowAfterRead = ackResponse2.ExtractTcp().WindowSize;
-        
-        // Window should be restored after data is consumed
-        Assert.IsTrue(windowAfterRead > windowAfterData, 
-            $"Window should increase after data is read. Before read: {windowAfterData}, After read: {windowAfterRead}");
+        // Window should be same fixed value (pipe backpressure handles flow control internally)
+        Assert.AreEqual(initialWindowSize, windowAfterData, 
+            "Window should remain fixed for loopback - pipe backpressure handles flow control");
 
         await stream.DisposeAsync();
     }

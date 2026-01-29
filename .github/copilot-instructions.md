@@ -1,1 +1,2 @@
 - Do not implement not supported method with GetAwaiter().GetResult()
+- Use normal and small WindowSize as we are in loopback and transfer speed is not an issue

@@ -71,9 +71,6 @@ public sealed class LocalTcpStream : Stream
 
         reader.AdvanceTo(readResult.Buffer.GetPosition(bytesToCopy));
         
-        // Notify connection that data was consumed - this updates the window size
-        _connection.OnDataConsumed(bytesToCopy);
-        
         return bytesToCopy;
     }
 
