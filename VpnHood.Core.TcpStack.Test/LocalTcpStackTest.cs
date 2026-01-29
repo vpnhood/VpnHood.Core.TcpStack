@@ -329,4 +329,211 @@ public sealed class LocalTcpStackTest
         RandomNumberGenerator.Fill(data);
         return data;
     }
+
+    /// <summary>
+    /// Tests that retransmitted packets are properly ACKed without duplicating data
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public async Task RetransmittedPacket_ShouldBeAckedWithoutDuplicatingData()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        object lockObj = new();
+        tcpStack.OnPacketSend = packet =>
+        {
+            lock (lockObj) sentPackets.Add(packet);
+        };
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Complete handshake
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+        
+        IpPacket synAckPacket;
+        lock (lockObj) { synAckPacket = sentPackets[0]; }
+        var synAckTcp = synAckPacket.ExtractTcp();
+        var serverSeq = synAckTcp.SequenceNumber;
+        
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var stream = await acceptTask.WaitAsync(cts.Token);
+        lock (lockObj) sentPackets.Clear();
+
+        // Act - Send data packet
+        var testData = new byte[] { 0x01, 0x02, 0x03, 0x04, 0x05 };
+        var dataPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
+        tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
+        
+        // Wait for ACK
+        await Task.Delay(50);
+        
+        int ackCountAfterFirst;
+        lock (lockObj) { ackCountAfterFirst = sentPackets.Count; }
+        Assert.IsTrue(ackCountAfterFirst >= 1, "Should send ACK for data");
+        
+        // Act - Simulate retransmission (same packet again)
+        tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
+        
+        // Wait for ACK of retransmit
+        await Task.Delay(50);
+        
+        int ackCountAfterRetransmit;
+        lock (lockObj) { ackCountAfterRetransmit = sentPackets.Count; }
+        Assert.IsTrue(ackCountAfterRetransmit > ackCountAfterFirst, "Should ACK retransmitted packet");
+
+        // Read data from stream - should only get 5 bytes, not 10
+        var buffer = new byte[100];
+        var bytesRead = await stream.ReadAsync(buffer, cts.Token);
+        
+        Assert.AreEqual(testData.Length, bytesRead, "Should receive original data only once");
+        CollectionAssert.AreEqual(testData, buffer.Take(bytesRead).ToArray(), "Data should match");
+
+        await stream.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Tests that window size changes based on buffer consumption
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public async Task WindowSize_ShouldReflectBufferState()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        object lockObj = new();
+        tcpStack.OnPacketSend = packet =>
+        {
+            lock (lockObj) sentPackets.Add(packet);
+        };
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Complete handshake
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+        
+        IpPacket synAckPacket;
+        lock (lockObj) { synAckPacket = sentPackets[0]; }
+        var synAckTcp = synAckPacket.ExtractTcp();
+        var serverSeq = synAckTcp.SequenceNumber;
+        
+        // Check initial window size (should be full)
+        var initialWindowSize = synAckTcp.WindowSize;
+        Assert.IsTrue(initialWindowSize > 0, "Initial window should be > 0");
+        
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var stream = await acceptTask.WaitAsync(cts.Token);
+        lock (lockObj) sentPackets.Clear();
+
+        // Send some data
+        var testData = new byte[1000];
+        RandomNumberGenerator.Fill(testData);
+        var dataPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
+        tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
+        
+        await Task.Delay(50);
+
+        // Get window size from ACK
+        IpPacket ackResponse;
+        lock (lockObj) { ackResponse = sentPackets.First(p => p.ExtractTcp().Acknowledgment); }
+        var windowAfterData = ackResponse.ExtractTcp().WindowSize;
+        
+        // Window should be reduced (data buffered but not read)
+        Assert.IsTrue(windowAfterData < initialWindowSize, 
+            $"Window should decrease when data is buffered. Initial: {initialWindowSize}, After: {windowAfterData}");
+
+        // Read all data
+        var buffer = new byte[2000];
+        await stream.ReadAsync(buffer, 0, testData.Length, cts.Token);
+        
+        // Send another packet to get updated window
+        lock (lockObj) sentPackets.Clear();
+        var dataPacket2 = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, psh: true, seq: 1001 + (uint)testData.Length, ackNum: serverSeq + 1, payload: [0x01]);
+        tcpStack.ProcessIncoming(dataPacket2.Buffer.Span);
+        
+        await Task.Delay(50);
+
+        IpPacket ackResponse2;
+        lock (lockObj) { ackResponse2 = sentPackets.First(p => p.ExtractTcp().Acknowledgment); }
+        var windowAfterRead = ackResponse2.ExtractTcp().WindowSize;
+        
+        // Window should be restored after data is consumed
+        Assert.IsTrue(windowAfterRead > windowAfterData, 
+            $"Window should increase after data is read. Before read: {windowAfterData}, After read: {windowAfterRead}");
+
+        await stream.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Tests that out-of-order packets trigger duplicate ACKs
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public async Task OutOfOrderPacket_ShouldTriggerDuplicateAck()
+    {
+        // Arrange
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        object lockObj = new();
+        tcpStack.OnPacketSend = packet =>
+        {
+            lock (lockObj) sentPackets.Add(packet);
+        };
+
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Complete handshake
+        var synPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+        
+        IpPacket synAckPacket;
+        lock (lockObj) { synAckPacket = sentPackets[0]; }
+        var synAckTcp = synAckPacket.ExtractTcp();
+        var serverSeq = synAckTcp.SequenceNumber;
+        
+        var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await acceptTask.WaitAsync(cts.Token);
+        lock (lockObj) sentPackets.Clear();
+
+        // Act - Send out-of-order packet (skipping seq 1001-1005)
+        var testData = new byte[] { 0x06, 0x07, 0x08, 0x09, 0x0A };
+        var outOfOrderPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
+            ack: true, psh: true, seq: 1006, ackNum: serverSeq + 1, payload: testData);
+        tcpStack.ProcessIncoming(outOfOrderPacket.Buffer.Span);
+        
+        await Task.Delay(50);
+
+        // Assert - Should send duplicate ACK for expected sequence
+        IpPacket[] packets;
+        lock (lockObj) { packets = sentPackets.ToArray(); }
+        
+        Assert.IsTrue(packets.Length >= 1, "Should send ACK");
+        var dupAck = packets.First(p => p.ExtractTcp().Acknowledgment);
+        var dupAckTcp = dupAck.ExtractTcp();
+        
+        // The ACK number should still be for seq 1001 (the expected next seq)
+        Assert.AreEqual(1001u, dupAckTcp.AcknowledgmentNumber, 
+            "Should ACK the expected sequence (indicating gap)");
+    }
 }

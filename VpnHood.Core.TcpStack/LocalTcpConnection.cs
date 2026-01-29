@@ -6,20 +6,34 @@ using VpnHood.Core.TcpStack.Primitives;
 
 namespace VpnHood.Core.TcpStack;
 
-internal sealed class LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemote) : IDisposable
+internal sealed class LocalTcpConnection : IDisposable
 {
-    private readonly Pipe _netToAppPipe = new(new PipeOptions(useSynchronizationContext: false));
+    // Default receive window size
+    private const int DefaultWindowSize = 65535;
+    
+    // Pipe options with reasonable buffer sizes for flow control
+    private static readonly PipeOptions NetToAppPipeOptions = new(
+        pauseWriterThreshold: DefaultWindowSize,
+        resumeWriterThreshold: DefaultWindowSize / 2,
+        useSynchronizationContext: false);
+    
+    private static readonly PipeOptions AppToNetPipeOptions = new(
+        useSynchronizationContext: false);
+
+    // Pipe for network -> app data (stream reads)
+    private readonly Pipe _netToAppPipe = new(NetToAppPipeOptions);
+    
+    // Pipe for app -> network data (stream writes)
+    private readonly Pipe _appToNetPipe = new(AppToNetPipeOptions);
+    
     private readonly Lock _lock = new();
     private bool _finSent;
     private bool _disposed;
+    private long _bytesBuffered; // Track how many bytes are buffered but not yet read by app
 
-    // Pipe for app -> network data (stream writes)
-    private readonly Pipe _appToNetPipe = new(new PipeOptions(useSynchronizationContext: false));
-    // Pipe for network -> app data (stream reads)
-
-    public Quad Quad { get; } = quad;
-    internal uint SndNxt { get; set; } = isnLocal;
-    public uint RcvNxt { get; private set; } = isnRemote + 1; // expecting after SYN
+    public Quad Quad { get; }
+    internal uint SndNxt { get; set; }
+    public uint RcvNxt { get; private set; }
     public TcpConnectionState State { get; internal set; } = TcpConnectionState.SynReceived;
     public CancellationToken ConnectionClosed => _cts.Token;
     private readonly CancellationTokenSource _cts = new();
@@ -28,6 +42,26 @@ internal sealed class LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemot
     /// PipeReader for reading data received from network (used by LocalTcpStream)
     /// </summary>
     public PipeReader NetToAppReader => _netToAppPipe.Reader;
+    
+    /// <summary>
+    /// Gets the current advertised window size based on buffer availability
+    /// </summary>
+    public ushort CurrentWindowSize
+    {
+        get
+        {
+            var buffered = Interlocked.Read(ref _bytesBuffered);
+            var available = DefaultWindowSize - buffered;
+            return (ushort)Math.Clamp(available, 0, ushort.MaxValue);
+        }
+    }
+
+    public LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemote)
+    {
+        Quad = quad;
+        SndNxt = isnLocal;
+        RcvNxt = isnRemote + 1; // expecting after SYN
+    }
 
     public void Dispose()
     {
@@ -50,26 +84,64 @@ internal sealed class LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemot
     }
 
     /// <summary>
-    /// Handles incoming TCP data from network - writes directly to pipe without allocation
+    /// Called when app reads data from the stream - updates window tracking
     /// </summary>
-    public bool TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload, LocalTcpStack stack)
+    internal void OnDataConsumed(int bytesConsumed)
     {
-        if (flags.HasFlag(TcpFlags.Rst)) { Close(); return false; }
-        if (seq != RcvNxt) return false; // out of order (not expected in localhost simplified model)
+        Interlocked.Add(ref _bytesBuffered, -bytesConsumed);
+    }
+
+    /// <summary>
+    /// Handles incoming TCP data from network.
+    /// Returns: (handled, needsAck) - handled indicates if packet was processed, needsAck if ACK should be sent
+    /// </summary>
+    public (bool handled, bool needsAck) TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload, LocalTcpStack stack)
+    {
+        if (flags.HasFlag(TcpFlags.Rst)) 
+        { 
+            Close(); 
+            return (false, false); 
+        }
+
+        // Handle sequence number scenarios
+        var seqDiff = (long)seq - RcvNxt;
         
+        if (seqDiff < 0)
+        {
+            // This is a retransmission of data we've already received
+            // We need to ACK it so the sender knows we got it, but don't process the data again
+            
+            // Check if this retransmission overlaps with data we haven't received yet
+            var retransmitEnd = seq + (uint)payload.Length;
+            if (retransmitEnd > RcvNxt && payload.Length > 0)
+            {
+                // Partial overlap - extract only the new portion
+                var overlap = (int)(RcvNxt - seq);
+                var newData = payload.Slice(overlap);
+                if (newData.Length > 0)
+                {
+                    WriteToAppPipe(newData);
+                    RcvNxt += (uint)newData.Length;
+                }
+            }
+            
+            // Always ACK retransmissions so sender stops retrying
+            return (true, true);
+        }
+        
+        if (seqDiff > 0)
+        {
+            // Out of order packet - we're missing data
+            // In loopback this shouldn't happen often, but if it does, 
+            // we need to send a duplicate ACK to trigger fast retransmit
+            return (true, true);
+        }
+        
+        // seq == RcvNxt - this is the expected packet
         if (payload.Length > 0)
         {
+            WriteToAppPipe(payload);
             RcvNxt += (uint)payload.Length;
-            
-            // Write directly to pipe - uses pooled memory
-            var span = _netToAppPipe.Writer.GetSpan(payload.Length);
-            payload.CopyTo(span);
-            _netToAppPipe.Writer.Advance(payload.Length);
-            
-            // Flush synchronously since we're in the packet processing path
-            var flushTask = _netToAppPipe.Writer.FlushAsync();
-            if (!flushTask.IsCompleted)
-                flushTask.AsTask().GetAwaiter().GetResult();
         }
         
         if (flags.HasFlag(TcpFlags.Fin))
@@ -77,8 +149,39 @@ internal sealed class LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemot
             RcvNxt += 1;
             _netToAppPipe.Writer.Complete();
             State = TcpConnectionState.Closing;
+            return (true, true); // ACK the FIN
         }
-        return true;
+        
+        // Need ACK if we received data
+        return (true, payload.Length > 0);
+    }
+
+    private void WriteToAppPipe(ReadOnlySpan<byte> data)
+    {
+        // Track buffered bytes for window calculation
+        Interlocked.Add(ref _bytesBuffered, data.Length);
+        
+        // Get buffer from pipe and copy data
+        var span = _netToAppPipe.Writer.GetSpan(data.Length);
+        data.CopyTo(span);
+        _netToAppPipe.Writer.Advance(data.Length);
+        
+        // Flush asynchronously to avoid blocking packet processing
+        // The pipe has backpressure built in via pauseWriterThreshold
+        var flushTask = _netToAppPipe.Writer.FlushAsync();
+        if (!flushTask.IsCompleted)
+        {
+            // If flush would block, let it complete in background
+            // This prevents blocking the packet processing thread
+            _ = flushTask.AsTask().ContinueWith(t =>
+            {
+                if (t.IsFaulted)
+                {
+                    // Pipe was completed (connection closed)
+                    Close();
+                }
+            }, TaskContinuationOptions.OnlyOnFaulted);
+        }
     }
 
     /// <summary>
@@ -118,7 +221,7 @@ internal sealed class LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemot
                     tcp.AcknowledgmentNumber = RcvNxt;
                     tcp.Acknowledgment = true;
                     tcp.Push = true;
-                    tcp.WindowSize = 65535; // Advertise large receive window
+                    tcp.WindowSize = CurrentWindowSize;
                     
                     SndNxt += (uint)segment.Length;
                     stack.SendPacket(tcpPacket);
@@ -167,7 +270,7 @@ internal sealed class LocalTcpConnection(Quad quad, uint isnLocal, uint isnRemot
             tcp.AcknowledgmentNumber = RcvNxt;
             tcp.Finish = true;
             tcp.Acknowledgment = true;
-            tcp.WindowSize = 65535; // Advertise large receive window
+            tcp.WindowSize = CurrentWindowSize;
             
             SndNxt += 1;
             stack.SendPacket(tcpPacket);

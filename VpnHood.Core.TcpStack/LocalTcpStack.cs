@@ -100,7 +100,7 @@ public sealed class LocalTcpStack
         synAckTcp.AcknowledgmentNumber = tcpPacket.SequenceNumber + 1;
         synAckTcp.Synchronize = true;
         synAckTcp.Acknowledgment = true;
-        synAckTcp.WindowSize = 65535; // Advertise large receive window
+        synAckTcp.WindowSize = conn.CurrentWindowSize;
 
         SendPacket(synAckPacket);
         conn.SndNxt += 1; // SYN counts as one sequence number
@@ -120,14 +120,20 @@ public sealed class LocalTcpStack
         if (tcpPacket.Reset) flags |= TcpFlags.Rst;
         if (tcpPacket.Acknowledgment) flags |= TcpFlags.Ack;
 
-        if (!conn.TryHandleIncoming(tcpPacket.SequenceNumber, tcpPacket.AcknowledgmentNumber, flags, tcpPacket.Payload.Span, this))
+        var (handled, needsAck) = conn.TryHandleIncoming(
+            tcpPacket.SequenceNumber, 
+            tcpPacket.AcknowledgmentNumber, 
+            flags, 
+            tcpPacket.Payload.Span, 
+            this);
+        
+        if (!handled)
             return;
 
-        // Don't respond to pure ACKs (no payload, no FIN)
-        if (tcpPacket is { Acknowledgment: true, Payload.Length: 0, Finish: false })
+        // Send ACK if needed (for data, retransmissions, FIN, etc.)
+        if (!needsAck)
             return;
 
-        // Send ACK for received data or FIN
         var ackPacket = PacketBuilder.BuildTcp(
             dstEndPoint, srcEndPoint,
             ReadOnlySpan<byte>.Empty,
@@ -137,7 +143,7 @@ public sealed class LocalTcpStack
         ackTcp.SequenceNumber = conn.SndNxt;
         ackTcp.AcknowledgmentNumber = conn.RcvNxt;
         ackTcp.Acknowledgment = true;
-        ackTcp.WindowSize = 65535; // Advertise large receive window
+        ackTcp.WindowSize = conn.CurrentWindowSize;
 
         SendPacket(ackPacket);
     }

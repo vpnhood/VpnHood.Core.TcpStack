@@ -1,7 +1,6 @@
 ﻿using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using System.Text;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.Toolkit.Net;
@@ -15,7 +14,7 @@ public sealed class TcpStackIntegrationTest
 {
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
-    private const int TestDataSize = 100 * 1024; // 100KB for faster testing
+    private const int TestDataSize = 1024 * 1024 * 1;  // 10 MB
 
     /// <summary>
     /// Diagnostic test with minimal data to understand WinDivert integration issues
@@ -120,7 +119,7 @@ public sealed class TcpStackIntegrationTest
                             Console.WriteLine("[SERVER] Connection closed by client");
                             break;
                         }
-                        
+
                         lock (serverReceivedData)
                             serverReceivedData.AddRange(buffer.Take(bytesRead));
                         
@@ -154,8 +153,6 @@ public sealed class TcpStackIntegrationTest
             await adapter.Start(options, CancellationToken.None);
             Console.WriteLine("[SETUP] Adapter started");
             
-            await Task.Delay(1000); // Wait for setup
-            
             // Connect with TcpClient
             Console.WriteLine("[CLIENT] Creating TcpClient...");
             using var tcpClient = new TcpClient();
@@ -169,10 +166,10 @@ public sealed class TcpStackIntegrationTest
             await using var stream = tcpClient.GetStream();
             
             // Send just 5 bytes: "HELLO"
-            var testData = Encoding.ASCII.GetBytes("HELLO");
+            var testData = "HELLO"u8.ToArray();
             Console.WriteLine($"[CLIENT] Sending {testData.Length} bytes: {BitConverter.ToString(testData)}");
-            await stream.WriteAsync(testData);
-            await stream.FlushAsync();
+            await stream.WriteAsync(testData, connectCts.Token);
+            await stream.FlushAsync(connectCts.Token);
             Console.WriteLine("[CLIENT] Data sent, waiting for echo...");
             
             // Wait for echo
