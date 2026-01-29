@@ -149,7 +149,5 @@ public sealed class LocalTcpStream : Stream
         await _cts.CancelAsync();
         _connection.StartFin(_stack);
         _cts.Dispose();
-        
-        GC.SuppressFinalize(this);
     }
 }
