@@ -112,86 +112,85 @@ internal sealed class LocalTcpConnection(
             return (false, false);
         }
 
-        lock (_lock) // Protect RcvNxt modifications
+        try
         {
-            // Handle sequence number scenarios
-            var seqDiff = (long)seq - RcvNxt;
-
-            if (seqDiff < 0)
+            lock (_lock) // Protect RcvNxt modifications
             {
-                // Retransmission - ACK it but don't duplicate data
-                // Check for partial overlap with new data
-                var retransmitEnd = seq + (uint)payload.Length;
-                if (retransmitEnd > RcvNxt && payload.Length > 0)
+                // Handle sequence number scenarios
+                var seqDiff = (long)seq - RcvNxt;
+
+                if (seqDiff < 0)
                 {
-                    var overlap = (int)(RcvNxt - seq);
-                    var newData = payload[overlap..];
-                    if (newData.Length > 0)
+                    // Retransmission - ACK it but don't duplicate data
+                    // Check for partial overlap with new data
+                    var retransmitEnd = seq + (uint)payload.Length;
+                    if (retransmitEnd > RcvNxt && payload.Length > 0)
                     {
-                        WriteToAppPipe(newData);
-                        RcvNxt += (uint)newData.Length;
+                        var overlap = (int)(RcvNxt - seq);
+                        var newData = payload[overlap..];
+                        if (newData.Length > 0)
+                        {
+                            WriteToAppPipe(newData);
+                            RcvNxt += (uint)newData.Length;
+                        }
                     }
+                    return (true, true); // ACK retransmissions
                 }
-                return (true, true); // ACK retransmissions
-            }
 
-            if (seqDiff > 0)
-            {
-                // Out of order - send duplicate ACK to trigger fast retransmit
-                return (true, true);
-            }
-
-            // seq == RcvNxt - expected packet
-            if (payload.Length > 0)
-            {
-                WriteToAppPipe(payload);
-                RcvNxt += (uint)payload.Length;
-            }
-
-            if (flags.HasFlag(TcpFlags.Fin))
-            {
-                RcvNxt += 1;
-                _finReceived = true;
-                CompleteNetToApp();
-
-                // Check if both sides have sent FIN
-                if (_finSent)
+                if (seqDiff > 0)
                 {
-                    State = TcpConnectionState.Closed;
-                    Close();
+                    // Out of order - send duplicate ACK to trigger fast retransmit
+                    return (true, true);
                 }
-                else
+
+                // seq == RcvNxt - expected packet
+                if (payload.Length > 0)
                 {
-                    State = TcpConnectionState.Closing;
+                    WriteToAppPipe(payload);
+                    RcvNxt += (uint)payload.Length;
                 }
-                return (true, true); // ACK the FIN
+
+                if (flags.HasFlag(TcpFlags.Fin))
+                {
+                    RcvNxt += 1;
+                    _finReceived = true;
+                    CompleteNetToApp();
+
+                    // Check if both sides have sent FIN
+                    if (_finSent)
+                    {
+                        State = TcpConnectionState.Closed;
+                        Close();
+                    }
+                    else
+                    {
+                        State = TcpConnectionState.Closing;
+                    }
+                    return (true, true); // ACK the FIN
+                }
             }
+
+            return (true, payload.Length > 0);
         }
-
-        return (true, payload.Length > 0);
+        catch (InvalidOperationException)
+        {
+            // Pipe was completed/broken - close connection
+            Close();
+            return (false, false);
+        }
     }
 
     private void WriteToAppPipe(ReadOnlySpan<byte> data)
     {
         if (_disposed || _netToAppCompleted) return;
 
-        try
-        {
-            var span = _netToAppPipe.Writer.GetSpan(data.Length);
-            data.CopyTo(span);
-            _netToAppPipe.Writer.Advance(data.Length);
+        var span = _netToAppPipe.Writer.GetSpan(data.Length);
+        data.CopyTo(span);
+        _netToAppPipe.Writer.Advance(data.Length);
 
-            // Fire-and-forget flush - pipe backpressure handles flow control
-            var flushTask = _netToAppPipe.Writer.FlushAsync();
-            if (!flushTask.IsCompleted)
-            {
-                _ = flushTask.AsTask().ContinueWith(static _ => { }, TaskContinuationOptions.OnlyOnFaulted);
-            }
-        }
-        catch (InvalidOperationException)
-        {
-            // Pipe was completed
-        }
+        // Fire-and-forget flush - discarding ValueTask has no allocation overhead
+        // If flush fails, reader will get exception which is appropriate
+        _ = _netToAppPipe.Writer.FlushAsync();
     }
 
     private void Touch()

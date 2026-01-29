@@ -41,21 +41,21 @@ public sealed class LocalTcpListener : IDisposable
     /// <summary>
     /// Asynchronously accepts all incoming connections.
     /// </summary>
-    /// <param name="ct">Cancellation token to stop accepting connections.</param>
+    /// <param name="cancellationToken">Cancellation token to stop accepting connections.</param>
     /// <returns>An async enumerable of connected streams.</returns>
-    public IAsyncEnumerable<LocalTcpStream> AcceptAllAsync(CancellationToken ct = default)
+    public IAsyncEnumerable<LocalTcpStream> AcceptAllAsync(CancellationToken cancellationToken = default)
     {
-        return _acceptQueue.Reader.ReadAllAsync(ct);
+        return _acceptQueue.Reader.ReadAllAsync(cancellationToken);
     }
 
     /// <summary>
     /// Asynchronously accepts a single incoming connection.
     /// </summary>
-    /// <param name="ct">Cancellation token.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The accepted stream.</returns>
-    public async ValueTask<LocalTcpStream> AcceptAsync(CancellationToken ct = default)
+    public async ValueTask<LocalTcpStream> AcceptAsync(CancellationToken cancellationToken = default)
     {
-        return await _acceptQueue.Reader.ReadAsync(ct);
+        return await _acceptQueue.Reader.ReadAsync(cancellationToken);
     }
 
     /// <summary>
@@ -71,9 +71,7 @@ public sealed class LocalTcpListener : IDisposable
         
         // Dispose any unaccepted streams
         while (_acceptQueue.Reader.TryRead(out var stream))
-        {
             stream.Dispose();
-        }
     }
 
     /// <inheritdoc />
