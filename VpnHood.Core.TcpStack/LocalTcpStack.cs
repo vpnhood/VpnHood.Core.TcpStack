@@ -43,8 +43,7 @@ public sealed class LocalTcpStack : IDisposable
     public LocalTcpListener ListenAny()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var anyEndPoint = new IpEndPointValue(IPAddress.IPv6Any, 0);
-        return _anyListener ??= new LocalTcpListener(this, anyEndPoint);
+        return _anyListener ??= new LocalTcpListener(this, null);
     }
 
     public bool StopListening(IPEndPoint localEndPoint)
@@ -57,14 +56,20 @@ public sealed class LocalTcpStack : IDisposable
     /// </summary>
     public bool StopListening(IpEndPointValue localEndPoint)
     {
-        if (_anyListener != null && _anyListener.LocalEndPoint.Equals(localEndPoint))
-        {
-            _anyListener = null;
-            return true;
-        }
-
         var endPointStruct = new IpEndPointValue(localEndPoint.Address, localEndPoint.Port);
         return _listeners.TryRemove(endPointStruct, out _);
+    }
+
+    /// <summary>
+    /// Stops the wildcard listener that accepts connections on any endpoint.
+    /// </summary>
+    internal bool StopListeningAny()
+    {
+        if (_anyListener == null)
+            return false;
+
+        _anyListener = null;
+        return true;
     }
 
     /// <summary>

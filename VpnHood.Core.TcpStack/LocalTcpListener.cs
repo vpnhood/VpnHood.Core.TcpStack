@@ -1,4 +1,3 @@
-using System.Net;
 using System.Threading.Channels;
 using VpnHood.Core.Toolkit.Net;
 
@@ -18,11 +17,16 @@ public sealed class LocalTcpListener : IDisposable
 
     /// <summary>
     /// The local endpoint this listener is bound to.
+    /// Null indicates a wildcard listener that accepts connections on any endpoint (both IPv4 and IPv6).
     /// </summary>
-    public IpEndPointValue LocalEndPoint { get; }
+    public IpEndPointValue? LocalEndPoint { get; }
 
+    /// <summary>
+    /// Indicates whether this listener accepts connections on any endpoint.
+    /// </summary>
+    public bool IsAny => LocalEndPoint is null;
 
-    internal LocalTcpListener(LocalTcpStack stack, IpEndPointValue localEndPoint)
+    internal LocalTcpListener(LocalTcpStack stack, IpEndPointValue? localEndPoint)
     {
         _stack = stack;
         LocalEndPoint = localEndPoint;
@@ -69,7 +73,10 @@ public sealed class LocalTcpListener : IDisposable
         _stopped = true;
         
         _acceptQueue.Writer.TryComplete();
-        _stack.StopListening(LocalEndPoint);
+        if (LocalEndPoint.HasValue)
+            _stack.StopListening(LocalEndPoint.Value);
+        else
+            _stack.StopListeningAny();
         
         // Dispose any unaccepted streams
         while (_acceptQueue.Reader.TryRead(out var stream))
