@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Net;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -12,11 +13,15 @@ public sealed class LocalTcpStream : Stream
     private readonly LocalTcpStack _stack;
     private readonly CancellationTokenSource _cts = new();
     private int _disposed;
+    public IPEndPoint LocalEndPoint { get; } 
+    public IPEndPoint RemoteEndPoint { get; }
 
     internal LocalTcpStream(LocalTcpConnection connection, LocalTcpStack stack)
     {
         _connection = connection;
         _stack = stack;
+        LocalEndPoint = connection.EndPointQuad.Destination.ToIPEndPoint();
+        RemoteEndPoint = connection.EndPointQuad.Source.ToIPEndPoint();
     }
 
     private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
