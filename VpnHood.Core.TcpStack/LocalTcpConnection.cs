@@ -10,7 +10,7 @@ using VpnHood.Core.Toolkit.Utils;
 namespace VpnHood.Core.TcpStack;
 
 internal sealed class LocalTcpConnection(
-    IpEndPointQuad ipEndPointQuad, uint isnLocal, uint isnRemote, TimeSpan? tcpTimeout = null) : IDisposable
+    IpEndPointQuad endPointQuad, uint isnLocal, uint isnRemote, TimeSpan? tcpTimeout = null) : IDisposable
 {
     // For loopback, we use a moderate fixed window size.
     // The pipe's internal backpressure handles flow control.
@@ -43,7 +43,7 @@ internal sealed class LocalTcpConnection(
     private bool _netToAppCompleted;
     private bool _appToNetCompleted;
 
-    public IpEndPointQuad IpEndPointQuad { get; } = ipEndPointQuad;
+    public IpEndPointQuad EndPointQuad { get; } = endPointQuad;
     internal uint SndNxt { get; set; } = isnLocal;
     public uint RcvNxt { get; private set; } = isnRemote + 1; // expecting after SYN
     public TcpConnectionState State { get; internal set; } = TcpConnectionState.SynReceived;
@@ -250,7 +250,7 @@ internal sealed class LocalTcpConnection(
                         continue;
 
                     var tcpPacket = PacketBuilder.BuildTcp(
-                        IpEndPointQuad.Destination, IpEndPointQuad.Source,
+                        EndPointQuad.Destination, EndPointQuad.Source,
                         ReadOnlySpan<byte>.Empty,
                         segment.Span);
 
@@ -277,7 +277,7 @@ internal sealed class LocalTcpConnection(
         catch (Exception)
         {
             // Log exception if needed
-            VhLogger.Instance.LogError("Exception in EmitPendingAsync for connection {0}", IpEndPointQuad);
+            VhLogger.Instance.LogError("Exception in EmitPendingAsync for connection {0}", EndPointQuad);
         }
         finally
         {
@@ -295,7 +295,7 @@ internal sealed class LocalTcpConnection(
             CompleteAppToNet();
 
             var tcpPacket = PacketBuilder.BuildTcp(
-                IpEndPointQuad.Destination, IpEndPointQuad.Source,
+                EndPointQuad.Destination, EndPointQuad.Source,
                 ReadOnlySpan<byte>.Empty,
                 ReadOnlySpan<byte>.Empty);
 

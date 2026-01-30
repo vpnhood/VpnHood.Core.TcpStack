@@ -94,7 +94,7 @@ public sealed class TcpStackIntegrationTest
         };
         
         // Setup listener
-        var listener = tcpStack.Listen(new IPEndPoint(TestServerIp, TestServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(TestServerIp, TestServerPort));
         Console.WriteLine($"[SETUP] TCP Stack listening on {TestServerIp}:{TestServerPort}");
         
         // Simple echo server that logs everything
@@ -307,7 +307,7 @@ public sealed class TcpStackIntegrationTest
         };
         
         // Setup echo server on our TCP stack
-        var listener = tcpStack.Listen(new IPEndPoint(TestServerIp, TestServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(TestServerIp, TestServerPort));
         Console.WriteLine($"[TEST] Echo server listener created on {TestServerIp}:{TestServerPort}");
         
         _ = StartEchoServer(listener, completionSource);

@@ -1,5 +1,6 @@
 ﻿using System.Net;
 using System.Text;
+using VpnHood.Core.Toolkit.Net;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -20,7 +21,7 @@ class Program
         });
         
         // Listen on localhost:8080
-        var listener = tcpStack.Listen(new IPEndPoint(IPAddress.Loopback, 8080));
+        var listener = tcpStack.Listen(new IpEndPointValue(IPAddress.Loopback, 8080));
         Console.WriteLine("TCP Stack listening on 127.0.0.1:8080");
         
         // Start echo server

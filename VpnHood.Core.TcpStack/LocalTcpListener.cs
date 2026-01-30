@@ -1,5 +1,6 @@
 using System.Net;
 using System.Threading.Channels;
+using VpnHood.Core.Toolkit.Net;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -18,9 +19,10 @@ public sealed class LocalTcpListener : IDisposable
     /// <summary>
     /// The local endpoint this listener is bound to.
     /// </summary>
-    public IPEndPoint LocalEndPoint { get; }
+    public IpEndPointValue LocalEndPoint { get; }
 
-    internal LocalTcpListener(LocalTcpStack stack, IPEndPoint localEndPoint)
+
+    internal LocalTcpListener(LocalTcpStack stack, IpEndPointValue localEndPoint)
     {
         _stack = stack;
         LocalEndPoint = localEndPoint;

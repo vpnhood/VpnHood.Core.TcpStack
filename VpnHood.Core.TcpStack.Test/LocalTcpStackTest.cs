@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Cryptography;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
+using VpnHood.Core.Toolkit.Net;
 
 namespace VpnHood.Core.TcpStack.Test;
 
@@ -25,7 +26,7 @@ public sealed class LocalTcpStackTest
         var sentPackets = new List<IpPacket>();
         tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Act - Send SYN packet
@@ -64,7 +65,7 @@ public sealed class LocalTcpStackTest
         var sentPackets = new List<IpPacket>();
         tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Complete handshake
@@ -113,7 +114,7 @@ public sealed class LocalTcpStackTest
         var sentPackets = new List<IpPacket>();
         tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Complete handshake
@@ -169,7 +170,7 @@ public sealed class LocalTcpStackTest
             }
         };
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         
         // Start echo server
         var echoServerTask = Task.Run(async () =>
@@ -243,7 +244,7 @@ public sealed class LocalTcpStackTest
             }
         };
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Complete handshake
@@ -339,7 +340,7 @@ public sealed class LocalTcpStackTest
             lock (lockObj) sentPackets.Add(packet);
         };
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Complete handshake
@@ -408,7 +409,7 @@ public sealed class LocalTcpStackTest
             lock (lockObj) sentPackets.Add(packet);
         };
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Complete handshake
@@ -470,7 +471,7 @@ public sealed class LocalTcpStackTest
             lock (lockObj) sentPackets.Add(packet);
         };
 
-        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Complete handshake

@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.TcpStack.Primitives;
+using VpnHood.Core.Toolkit.Net;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -17,7 +18,7 @@ public sealed class LocalTcpStack : IDisposable
     private const ushort LoopbackWindowSize = 16384;
 
     private readonly ConcurrentDictionary<IpEndPointQuad, LocalTcpConnection> _connections = new();
-    private readonly ConcurrentDictionary<IPEndPoint, LocalTcpListener> _listeners = new();
+    private readonly ConcurrentDictionary<IpEndPointValue, LocalTcpListener> _listeners = new();
     private LocalTcpListener? _anyListener;
     private bool _disposed;
 
@@ -29,10 +30,11 @@ public sealed class LocalTcpStack : IDisposable
     /// <summary>
     /// Creates a TCP listener on the specified local endpoint.
     /// </summary>
-    public LocalTcpListener Listen(IPEndPoint localEndPoint)
+    public LocalTcpListener Listen(IpEndPointValue localEndPoint)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        return _listeners.GetOrAdd(localEndPoint, ep => new LocalTcpListener(this, ep));
+        var ipEndPoint = new IpEndPointValue(localEndPoint.Address, localEndPoint.Port);
+        return _listeners.GetOrAdd(ipEndPoint, _ => new LocalTcpListener(this, localEndPoint));
     }
 
     /// <summary>
@@ -41,13 +43,19 @@ public sealed class LocalTcpStack : IDisposable
     public LocalTcpListener ListenAny()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        return _anyListener ??= new LocalTcpListener(this, new IPEndPoint(IPAddress.IPv6Any, 0));
+        var anyEndPoint = new IpEndPointValue(IPAddress.IPv6Any, 0);
+        return _anyListener ??= new LocalTcpListener(this, anyEndPoint);
+    }
+
+    public bool StopListening(IPEndPoint localEndPoint)
+    {
+        return StopListening(localEndPoint.ToIpEndPointValue());
     }
 
     /// <summary>
     /// Stops listening on the specified endpoint and removes the listener.
     /// </summary>
-    public bool StopListening(IPEndPoint localEndPoint)
+    public bool StopListening(IpEndPointValue localEndPoint)
     {
         if (_anyListener != null && _anyListener.LocalEndPoint.Equals(localEndPoint))
         {
@@ -55,7 +63,8 @@ public sealed class LocalTcpStack : IDisposable
             return true;
         }
 
-        return _listeners.TryRemove(localEndPoint, out _);
+        var endPointStruct = new IpEndPointValue(localEndPoint.Address, localEndPoint.Port);
+        return _listeners.TryRemove(endPointStruct, out _);
     }
 
     /// <summary>
@@ -73,28 +82,28 @@ public sealed class LocalTcpStack : IDisposable
                 return;
 
             var tcpPacket = ipPacket.ExtractTcp();
-            var srcEndPoint = new IPEndPoint(ipPacket.SourceAddress, tcpPacket.SourcePort);
-            var dstEndPoint = new IPEndPoint(ipPacket.DestinationAddress, tcpPacket.DestinationPort);
-            var ipEndPointQuad = new IpEndPointQuad(srcEndPoint, dstEndPoint);
+            var ipEndPointQuad = new IpEndPointQuad(
+                new IpEndPointValue(ipPacket.SourceAddress, tcpPacket.SourcePort),
+                new IpEndPointValue(ipPacket.DestinationAddress, tcpPacket.DestinationPort));
 
             // Handle SYN packets (new connection requests)
             if (tcpPacket is { Synchronize: true, Acknowledgment: false })
             {
-                HandleSynPacket(ipEndPointQuad, dstEndPoint, srcEndPoint, tcpPacket);
+                HandleSynPacket(ipEndPointQuad, tcpPacket);
                 return;
             }
 
             // Handle packets for existing connections
             if (_connections.TryGetValue(ipEndPointQuad, out var existing))
             {
-                HandleExistingConnection(existing, tcpPacket, dstEndPoint, srcEndPoint);
+                HandleExistingConnection(existing, tcpPacket);
                 return;
             }
 
             // Unknown connection - send RST if not already a RST
             if (!tcpPacket.Reset)
             {
-                SendRst(dstEndPoint, srcEndPoint, tcpPacket);
+                SendRst(ipEndPointQuad.Destination, ipEndPointQuad.Source, tcpPacket);
             }
         }
         catch
@@ -103,13 +112,13 @@ public sealed class LocalTcpStack : IDisposable
         }
     }
 
-    private void HandleSynPacket(IpEndPointQuad ipEndPointQuad, IPEndPoint dstEndPoint, IPEndPoint srcEndPoint, TcpPacket tcpPacket)
+    private void HandleSynPacket(IpEndPointQuad ipEndPointQuad, TcpPacket tcpPacket)
     {
-        var listener = ResolveListener(dstEndPoint);
+        var listener = ResolveListener(ipEndPointQuad.Destination);
         if (listener == null)
         {
             // No listener - send RST
-            SendRst(dstEndPoint, srcEndPoint, tcpPacket);
+            SendRst(ipEndPointQuad.Destination, ipEndPointQuad.Source, tcpPacket);
             return;
         }
 
@@ -119,8 +128,7 @@ public sealed class LocalTcpStack : IDisposable
             // SYN retransmit - resend SYN-ACK
             if (existingConn.State == TcpConnectionState.SynReceived)
             {
-                var synAckPacket = PacketBuilder.BuildTcp(
-                    dstEndPoint, srcEndPoint,
+                var synAckPacket = PacketBuilder.BuildTcp(ipEndPointQuad.Destination, ipEndPointQuad.Source,
                     ReadOnlySpan<byte>.Empty,
                     ReadOnlySpan<byte>.Empty);
 
@@ -152,7 +160,7 @@ public sealed class LocalTcpStack : IDisposable
 
         // Send SYN-ACK
         var synAckPacket2 = PacketBuilder.BuildTcp(
-            dstEndPoint, srcEndPoint,
+            ipEndPointQuad.Destination, ipEndPointQuad.Source,
             ReadOnlySpan<byte>.Empty,
             ReadOnlySpan<byte>.Empty);
 
@@ -170,7 +178,7 @@ public sealed class LocalTcpStack : IDisposable
         tcpConnection.Start(this);
     }
 
-    private void HandleExistingConnection(LocalTcpConnection conn, TcpPacket tcpPacket, IPEndPoint dstEndPoint, IPEndPoint srcEndPoint)
+    private void HandleExistingConnection(LocalTcpConnection conn, TcpPacket tcpPacket)
     {
         // Transition from SynReceived to Established on first ACK
         if (conn.State == TcpConnectionState.SynReceived && tcpPacket.Acknowledgment)
@@ -194,7 +202,7 @@ public sealed class LocalTcpStack : IDisposable
             return;
 
         var ackPacket = PacketBuilder.BuildTcp(
-            dstEndPoint, srcEndPoint,
+            conn.EndPointQuad.Destination, conn.EndPointQuad.Source,
             ReadOnlySpan<byte>.Empty,
             ReadOnlySpan<byte>.Empty);
 
@@ -207,10 +215,10 @@ public sealed class LocalTcpStack : IDisposable
         SendPacket(ackPacket);
     }
 
-    private void SendRst(IPEndPoint localEndPoint, IPEndPoint remoteEndPoint, TcpPacket incomingTcp)
+    private void SendRst(IpEndPointValue localEndPoint, IpEndPointValue remoteEndPoint, TcpPacket incomingTcp)
     {
         var rstPacket = PacketBuilder.BuildTcp(
-            localEndPoint, remoteEndPoint,
+            localEndPoint.ToIPEndPoint(), remoteEndPoint.ToIPEndPoint(),
             ReadOnlySpan<byte>.Empty,
             ReadOnlySpan<byte>.Empty);
 
@@ -237,7 +245,7 @@ public sealed class LocalTcpStack : IDisposable
 
     private void OnConnectionClosed(LocalTcpConnection conn)
     {
-        _connections.TryRemove(conn.IpEndPointQuad, out _);
+        _connections.TryRemove(conn.EndPointQuad, out _);
     }
 
     internal void SendPacket(IpPacket packet)
@@ -246,14 +254,14 @@ public sealed class LocalTcpStack : IDisposable
         OnPacketSend?.Invoke(packet);
     }
 
-    private LocalTcpListener? ResolveListener(IPEndPoint endPoint)
+    private LocalTcpListener? ResolveListener(IpEndPointValue endPoint)
     {
         // If no specific listeners, use the "any" listener if available
         if (_listeners.IsEmpty)
             return _anyListener;
 
         // Try to find a specific listener first
-        return _listeners.GetValueOrDefault(endPoint) ?? _anyListener;
+        return _listeners.TryGetValue(endPoint, out var listener) ? listener : _anyListener;
     }
 
     public void Dispose()
