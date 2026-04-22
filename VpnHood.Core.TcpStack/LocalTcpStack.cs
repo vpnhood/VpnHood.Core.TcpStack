@@ -48,7 +48,7 @@ public sealed class LocalTcpStack : IDisposable
 
     public bool StopListening(IPEndPoint localEndPoint)
     {
-        return StopListening(localEndPoint.ToIpEndPointValue());
+        return StopListening(localEndPoint.ToValue());
     }
 
     /// <summary>
