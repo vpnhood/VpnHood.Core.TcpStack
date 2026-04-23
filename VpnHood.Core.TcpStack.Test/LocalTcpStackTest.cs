@@ -24,7 +24,7 @@ public sealed class LocalTcpStackTest
         // Arrange
         var tcpStack = new LocalTcpStack();
         var sentPackets = new List<IpPacket>();
-        tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
+        tcpStack.OnPacketSend = sentPackets.Add;
 
         var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
@@ -63,7 +63,7 @@ public sealed class LocalTcpStackTest
         // Arrange
         var tcpStack = new LocalTcpStack();
         var sentPackets = new List<IpPacket>();
-        tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
+        tcpStack.OnPacketSend = sentPackets.Add;
 
         var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
@@ -84,7 +84,7 @@ public sealed class LocalTcpStackTest
         sentPackets.Clear();
 
         // Act - Send data from client to server
-        var testData = new byte[] { 0x48, 0x65, 0x6C, 0x6C, 0x6F }; // "Hello"
+        var testData = "Hello"u8.ToArray(); // "Hello"
         var dataPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
             ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
         tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
@@ -112,7 +112,7 @@ public sealed class LocalTcpStackTest
         // Arrange
         var tcpStack = new LocalTcpStack();
         var sentPackets = new List<IpPacket>();
-        tcpStack.OnPacketSend = packet => sentPackets.Add(packet);
+        tcpStack.OnPacketSend = sentPackets.Add;
 
         var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
@@ -133,11 +133,11 @@ public sealed class LocalTcpStackTest
         sentPackets.Clear();
 
         // Act - Server writes data
-        var responseData = new byte[] { 0x57, 0x6F, 0x72, 0x6C, 0x64 }; // "World"
+        var responseData = "World"u8.ToArray(); // "World"
         await stream.WriteAsync(responseData, 0, responseData.Length, cts.Token);
         
         // Give time for async packet emission
-        await Task.Delay(100);
+        await Task.Delay(100, cts.Token);
 
         // Assert - Should send data packet
         Assert.IsTrue(sentPackets.Count >= 1, "Should send data packet");
@@ -367,7 +367,7 @@ public sealed class LocalTcpStackTest
         tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
         
         // Wait for ACK
-        await Task.Delay(50);
+        await Task.Delay(50, cts.Token);
         
         int ackCountAfterFirst;
         lock (lockObj) { ackCountAfterFirst = sentPackets.Count; }
@@ -377,7 +377,7 @@ public sealed class LocalTcpStackTest
         tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
         
         // Wait for ACK of retransmit
-        await Task.Delay(50);
+        await Task.Delay(50, cts.Token);
         
         int ackCountAfterRetransmit;
         lock (lockObj) { ackCountAfterRetransmit = sentPackets.Count; }
@@ -441,7 +441,7 @@ public sealed class LocalTcpStackTest
             ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
         tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
         
-        await Task.Delay(50);
+        await Task.Delay(50, cts.Token);
 
         // Get window size from ACK - should be same (fixed for loopback)
         IpPacket ackResponse;
@@ -497,7 +497,7 @@ public sealed class LocalTcpStackTest
             ack: true, psh: true, seq: 1006, ackNum: serverSeq + 1, payload: testData);
         tcpStack.ProcessIncoming(outOfOrderPacket.Buffer.Span);
         
-        await Task.Delay(50);
+        await Task.Delay(50, cts.Token);
 
         // Assert - Should send duplicate ACK for expected sequence
         IpPacket[] packets;

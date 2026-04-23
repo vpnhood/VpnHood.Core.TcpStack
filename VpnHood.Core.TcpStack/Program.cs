@@ -8,6 +8,8 @@ class Program
 {
     static async Task Main(string[] args)
     {
+        _ = args; // Unused
+
         Console.WriteLine("LocalTcpStack Demo - Lightweight localhost-only TCP stack");
         Console.WriteLine("=========================================================");
         
@@ -58,7 +60,7 @@ class Program
                     }
                     finally
                     {
-                        stream.Dispose();
+                        await stream.DisposeAsync();
                     }
                 });
             }

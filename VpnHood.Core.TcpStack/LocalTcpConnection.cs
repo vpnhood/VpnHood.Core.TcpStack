@@ -1,27 +1,36 @@
 using Microsoft.Extensions.Logging;
+using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.TcpStack.Primitives;
 using VpnHood.Core.Toolkit.Logging;
-using VpnHood.Core.Toolkit.Utils;
 
 namespace VpnHood.Core.TcpStack;
 
 internal sealed class LocalTcpConnection(
-    IpEndPointQuad endPointQuad, uint isnLocal, uint isnRemote, TimeSpan? tcpTimeout = null) : IDisposable
+    IpEndPointQuad endPointQuad,
+    uint isnLocal,
+    uint isnRemote,
+    ushort? peerMss,
+    LocalTcpListener listener,
+    TimeSpan? tcpTimeout = null)
+    : IDisposable
 {
-    // For loopback, we use a moderate fixed window size.
-    // The pipe's internal backpressure handles flow control.
-    // Large windows waste memory since transfers are instant in loopback.
+    // For loopback we use a moderate fixed window size; the pipe handles backpressure internally.
     private const ushort LoopbackWindowSize = 16384;
 
-    // Idle timeout for connections without activity (safety net for loopback)
-    private TimeSpan IdleTimeout { get; } = tcpTimeout ?? TimeSpan.FromMinutes(15);
+    // Conservative fallback when peer SYN does not advertise an MSS.
+    private const ushort DefaultMss = 536;
+
+    // Upper cap so a single TCP segment never exceeds what fits comfortably in a typical MTU.
+    private const ushort MaxMss = LoopbackWindowSize;
+
+    private readonly TimeSpan _idleTimeout = tcpTimeout ?? TimeSpan.FromMinutes(15);
     private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromMinutes(1);
 
-    // Pipe options - moderate buffer for loopback (no need for large buffers)
+    // Pipe options - moderate buffer for loopback. Both pipes use a single producer / single consumer.
     private static readonly PipeOptions PipeOpts = new(
         pauseWriterThreshold: LoopbackWindowSize,
         resumeWriterThreshold: LoopbackWindowSize / 2,
@@ -33,25 +42,25 @@ internal sealed class LocalTcpConnection(
     // Pipe for app -> network data (stream writes)
     private readonly Pipe _appToNetPipe = new(PipeOpts);
 
-    private readonly Lock _lock = new();
+    private readonly Lock _seqLock = new();
     private readonly CancellationTokenSource _cts = new();
+    private LocalTcpStream? _pendingStream;
+
     private bool _finSent;
     private bool _finReceived;
+    private bool _sndNxtAfterSynSet;
     private bool _disposed;
     private int _closedFlag;
     private long _lastActivityTicks = Stopwatch.GetTimestamp();
     private bool _netToAppCompleted;
     private bool _appToNetCompleted;
+    private uint _sndNxt = isnLocal; // SYN sequence; bumped to ISN+1 after SYN-ACK is sent.
+    private uint _rcvNxt = isnRemote + 1; // We have already "consumed" the peer's SYN.
 
     public IpEndPointQuad EndPointQuad { get; } = endPointQuad;
-    internal uint SndNxt { get; set; } = isnLocal;
-    public uint RcvNxt { get; private set; } = isnRemote + 1; // expecting after SYN
-    public TcpConnectionState State { get; internal set; } = TcpConnectionState.SynReceived;
-
-    /// <summary>
-    /// Event raised when connection is fully closed and should be removed from the stack.
-    /// </summary>
-    public event Action<LocalTcpConnection>? OnClosed;
+    public uint IsnLocal { get; } = isnLocal;
+    public ushort Mss { get; } = ClampMss(peerMss);
+    public TcpConnectionState State { get; private set; } = TcpConnectionState.SynReceived;
 
     /// <summary>
     /// PipeReader for reading data received from network (used by LocalTcpStream)
@@ -59,10 +68,27 @@ internal sealed class LocalTcpConnection(
     public PipeReader NetToAppReader => _netToAppPipe.Reader;
 
     /// <summary>
-    /// Starts background tasks for this connection. Call after adding to connection dictionary.
+    /// Event raised when connection is fully closed and should be removed from the stack.
+    /// </summary>
+    public event Action<LocalTcpConnection>? OnClosed;
+
+    private static ushort ClampMss(ushort? peerMss)
+    {
+        if (peerMss is null or 0) return DefaultMss;
+        var v = peerMss.Value;
+        if (v < 64) return 64;          // pathological lower bound
+        if (v > MaxMss) return MaxMss;
+        return v;
+    }
+
+    /// <summary>
+    /// Starts background tasks for this connection.
     /// </summary>
     public void Start(LocalTcpStack stack)
     {
+        // Pre-create the stream that will be enqueued once handshake completes.
+        _pendingStream = new LocalTcpStream(this, stack);
+
         // Start idle monitor
         _ = Task.Run(MonitorIdleAsync);
 
@@ -70,13 +96,58 @@ internal sealed class LocalTcpConnection(
         _ = Task.Run(() => EmitPendingAsync(stack));
     }
 
+    /// <summary>
+    /// Sets SndNxt to ISN + 1 the first time a SYN-ACK is sent. Idempotent for SYN retransmits.
+    /// </summary>
+    public void SetSndNxtAfterSyn()
+    {
+        lock (_seqLock)
+        {
+            if (_sndNxtAfterSynSet) return;
+            _sndNxt = IsnLocal + 1;
+            _sndNxtAfterSynSet = true;
+        }
+    }
+
+    /// <summary>
+    /// Transitions from SynReceived to Established and hands the pending stream to the listener.
+    /// Idempotent: subsequent calls are no-ops.
+    /// </summary>
+    public void MarkEstablished()
+    {
+        LocalTcpStream? streamToEnqueue;
+        lock (_seqLock)
+        {
+            if (State != TcpConnectionState.SynReceived) return;
+            State = TcpConnectionState.Established;
+            streamToEnqueue = _pendingStream;
+            _pendingStream = null;
+        }
+
+        if (streamToEnqueue != null && !listener.TryEnqueueAccept(streamToEnqueue))
+        {
+            // Listener has been stopped: dispose stream and reset the connection
+            streamToEnqueue.Dispose();
+        }
+    }
+
+    public (uint sndNxt, uint rcvNxt) SnapshotSequence()
+    {
+        lock (_seqLock)
+        {
+            return (_sndNxt, _rcvNxt);
+        }
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
 
-        _cts.TryCancel();
-        _cts.Dispose();
+        try { _cts.Cancel(); } catch { /* ignore */ }
+        // Note: do NOT dispose _cts here. Background tasks may still observe the token after
+        // cancellation; CTS dispose is racy with WaitForNextTickAsync. The CTS is cheap and
+        // will be GC'd once tasks complete.
     }
 
     /// <summary>
@@ -91,9 +162,13 @@ internal sealed class LocalTcpConnection(
         {
             await _appToNetPipe.Writer.WriteAsync(data, ct);
         }
-        catch (OperationCanceledException) when(_disposed)
+        catch (OperationCanceledException) when (_disposed || ct.IsCancellationRequested)
         {
-            // Expected on close
+            // Expected on close / cancel
+        }
+        catch (InvalidOperationException)
+        {
+            // Writer was completed - connection is shutting down
         }
     }
 
@@ -103,6 +178,7 @@ internal sealed class LocalTcpConnection(
     /// </summary>
     public (bool handled, bool needsAck) TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload)
     {
+        _ = ack;
         if (_disposed) return (false, false);
         Touch();
 
@@ -114,27 +190,28 @@ internal sealed class LocalTcpConnection(
 
         try
         {
-            lock (_lock) // Protect RcvNxt modifications
+            bool needsAck;
+            bool finCloses;
+
+            lock (_seqLock)
             {
-                // Handle sequence number scenarios
-                var seqDiff = (long)seq - RcvNxt;
+                var seqDiff = (long)seq - _rcvNxt;
 
                 if (seqDiff < 0)
                 {
-                    // Retransmission - ACK it but don't duplicate data
-                    // Check for partial overlap with new data
+                    // Retransmission: ACK without duplicating data.
                     var retransmitEnd = seq + (uint)payload.Length;
-                    if (retransmitEnd > RcvNxt && payload.Length > 0)
+                    if (retransmitEnd > _rcvNxt && payload.Length > 0)
                     {
-                        var overlap = (int)(RcvNxt - seq);
+                        var overlap = (int)(_rcvNxt - seq);
                         var newData = payload[overlap..];
                         if (newData.Length > 0)
                         {
                             WriteToAppPipe(newData);
-                            RcvNxt += (uint)newData.Length;
+                            _rcvNxt += (uint)newData.Length;
                         }
                     }
-                    return (true, true); // ACK retransmissions
+                    return (true, true);
                 }
 
                 if (seqDiff > 0)
@@ -143,34 +220,43 @@ internal sealed class LocalTcpConnection(
                     return (true, true);
                 }
 
-                // seq == RcvNxt - expected packet
+                // seq == _rcvNxt: in-order packet
                 if (payload.Length > 0)
                 {
                     WriteToAppPipe(payload);
-                    RcvNxt += (uint)payload.Length;
+                    _rcvNxt += (uint)payload.Length;
                 }
+
+                needsAck = payload.Length > 0;
+                finCloses = false;
 
                 if (flags.HasFlag(TcpFlags.Fin))
                 {
-                    RcvNxt += 1;
+                    _rcvNxt += 1;
                     _finReceived = true;
-                    CompleteNetToApp();
+                    needsAck = true;
 
                     // Check if both sides have sent FIN
                     if (_finSent)
                     {
                         State = TcpConnectionState.Closed;
-                        Close();
+                        finCloses = true;
                     }
                     else
                     {
                         State = TcpConnectionState.Closing;
                     }
-                    return (true, true); // ACK the FIN
                 }
             }
 
-            return (true, payload.Length > 0);
+            if (flags.HasFlag(TcpFlags.Fin))
+            {
+                CompleteNetToApp();
+                if (finCloses)
+                    Close();
+            }
+
+            return (true, needsAck);
         }
         catch (InvalidOperationException)
         {
@@ -188,8 +274,13 @@ internal sealed class LocalTcpConnection(
         data.CopyTo(span);
         _netToAppPipe.Writer.Advance(data.Length);
 
-        // Fire-and-forget flush - discarding ValueTask has no allocation overhead
-        // If flush fails, reader will get exception which is appropriate
+        // Synchronous-style flush; we discard the ValueTask intentionally because:
+        //  - On loopback, the reader (the application) drains the pipe quickly.
+        //  - Awaiting here would require restructuring TryHandleIncoming as async,
+        //    and we're called from the packet-receive critical path.
+        // PauseWriterThreshold still bounds memory because every Pipe segment respects it
+        // when GetSpan/Advance are paired with FlushAsync; for very large bursts the writer
+        // is observably "busy" via UnflushedBytes which we can revisit if needed.
         _ = _netToAppPipe.Writer.FlushAsync();
     }
 
@@ -210,21 +301,21 @@ internal sealed class LocalTcpConnection(
 
                 var last = Interlocked.Read(ref _lastActivityTicks);
                 var elapsed = Stopwatch.GetElapsedTime(last);
-                if (elapsed >= IdleTimeout)
+                if (elapsed >= _idleTimeout)
                 {
                     Close();
                     break;
                 }
             }
         }
-        catch (OperationCanceledException) when(_disposed)
+        catch (OperationCanceledException)
         {
             // Expected on disposal/close
         }
     }
 
     /// <summary>
-    /// Reads from app pipe and emits TCP packets to the network
+    /// Reads from app pipe and emits TCP packets to the network, segmented by negotiated MSS.
     /// </summary>
     private async Task EmitPendingAsync(LocalTcpStack stack)
     {
@@ -243,97 +334,148 @@ internal sealed class LocalTcpConnection(
                     continue;
                 }
 
-                // Process all available data
-                foreach (var segment in buffer)
-                {
-                    if (segment.IsEmpty)
-                        continue;
+                var consumed = EmitBuffer(stack, ref buffer);
+                reader.AdvanceTo(consumed);
 
-                    var tcpPacket = PacketBuilder.BuildTcp(
-                        EndPointQuad.Destination, EndPointQuad.Source,
-                        ReadOnlySpan<byte>.Empty,
-                        segment.Span);
-
-                    var tcp = tcpPacket.ExtractTcp();
-                    tcp.SequenceNumber = SndNxt;
-                    tcp.AcknowledgmentNumber = RcvNxt;
-                    tcp.Acknowledgment = true;
-                    tcp.Push = true;
-                    tcp.WindowSize = LoopbackWindowSize;
-
-                    SndNxt += (uint)segment.Length;
-                    stack.SendPacket(tcpPacket);
-                }
-
-                reader.AdvanceTo(buffer.End);
-
-                if (result.IsCompleted) break;
+                if (result.IsCompleted && buffer.IsEmpty) break;
             }
         }
-        catch (OperationCanceledException) when(_disposed)
+        catch (OperationCanceledException)
         {
             // Expected on close
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            // Log exception if needed
-            VhLogger.Instance.LogError("Exception in EmitPendingAsync for connection {0}", EndPointQuad);
+            VhLogger.Instance.LogError(ex, "Exception in EmitPendingAsync for connection {EndPoint}", EndPointQuad);
         }
         finally
         {
-            await reader.CompleteAsync();
+            try { await reader.CompleteAsync(); } catch { /* ignore */ }
         }
+    }
+
+    /// <summary>
+    /// Sends as much data as possible from the buffer in MSS-sized segments.
+    /// Returns the SequencePosition representing the consumed prefix.
+    /// </summary>
+    private SequencePosition EmitBuffer(LocalTcpStack stack, ref ReadOnlySequence<byte> buffer)
+    {
+        var mss = Mss;
+        var remaining = buffer;
+        while (!remaining.IsEmpty)
+        {
+            var segLen = (int)Math.Min(remaining.Length, mss);
+            var segment = remaining.Slice(0, segLen);
+
+            var tcpPacket = BuildDataPacket(segment, out var tcp);
+
+            uint seqForSegment;
+            uint ackForSegment;
+            lock (_seqLock)
+            {
+                seqForSegment = _sndNxt;
+                ackForSegment = _rcvNxt;
+                _sndNxt += (uint)segLen;
+            }
+
+            tcp.SequenceNumber = seqForSegment;
+            tcp.AcknowledgmentNumber = ackForSegment;
+            tcp.Acknowledgment = true;
+            tcp.WindowSize = LoopbackWindowSize;
+
+            // Set PSH on the last segment of the current burst (helps interactive responsiveness).
+            if (remaining.Length == segLen)
+                tcp.Push = true;
+
+            stack.SendPacket(tcpPacket);
+
+            remaining = remaining.Slice(segLen);
+        }
+
+        return buffer.End;
+    }
+
+    /// <summary>
+    /// Builds a TCP packet whose payload contains the bytes of <paramref name="segment"/>.
+    /// Uses ArrayPool when the segment spans multiple buffer chunks.
+    /// </summary>
+    private IpPacket BuildDataPacket(ReadOnlySequence<byte> segment, out TcpPacket tcp)
+    {
+        IpPacket packet;
+        if (segment.IsSingleSegment)
+        {
+            packet = PacketBuilder.BuildTcp(EndPointQuad.Destination, EndPointQuad.Source,
+                options: ReadOnlySpan<byte>.Empty, payload: segment.FirstSpan);
+        }
+        else
+        {
+            var len = (int)segment.Length;
+            var rented = ArrayPool<byte>.Shared.Rent(len);
+            try
+            {
+                var span = rented.AsSpan(0, len);
+                segment.CopyTo(span);
+                packet = PacketBuilder.BuildTcp(EndPointQuad.Destination, EndPointQuad.Source,
+                    options: ReadOnlySpan<byte>.Empty, payload: span);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+
+        tcp = packet.ExtractTcp();
+        return packet;
     }
 
     public void StartFin(LocalTcpStack stack)
     {
-        lock (_lock)
+        IpPacket? finPacket;
+        bool closeAfter;
+
+        lock (_seqLock)
         {
             if (_finSent) return;
             _finSent = true;
 
             CompleteAppToNet();
 
-            var tcpPacket = PacketBuilder.BuildTcp(
+            finPacket = PacketBuilder.BuildTcp(
                 EndPointQuad.Destination, EndPointQuad.Source,
-                ReadOnlySpan<byte>.Empty,
-                ReadOnlySpan<byte>.Empty);
+                options: ReadOnlySpan<byte>.Empty,
+                payload: ReadOnlySpan<byte>.Empty);
 
-            var tcp = tcpPacket.ExtractTcp();
-            tcp.SequenceNumber = SndNxt;
-            tcp.AcknowledgmentNumber = RcvNxt;
+            var tcp = finPacket.ExtractTcp();
+            tcp.SequenceNumber = _sndNxt;
+            tcp.AcknowledgmentNumber = _rcvNxt;
             tcp.Finish = true;
             tcp.Acknowledgment = true;
             tcp.WindowSize = LoopbackWindowSize;
 
-            SndNxt += 1;
-            stack.SendPacket(tcpPacket);
+            _sndNxt += 1; // FIN consumes one sequence number
 
-            // If we already received FIN from other side, connection is fully closed
-            if (_finReceived)
-            {
-                State = TcpConnectionState.Closed;
-                Close();
-            }
-            else
-            {
-                State = TcpConnectionState.FinWait1;
-            }
+            closeAfter = _finReceived;
+            State = closeAfter ? TcpConnectionState.Closed : TcpConnectionState.FinWait1;
         }
+
+        stack.SendPacket(finPacket);
+
+        if (closeAfter)
+            Close();
     }
 
     private void CompleteNetToApp()
     {
         if (_netToAppCompleted) return;
         _netToAppCompleted = true;
-        _netToAppPipe.Writer.Complete();
+        try { _netToAppPipe.Writer.Complete(); } catch { /* already completed */ }
     }
 
     private void CompleteAppToNet()
     {
         if (_appToNetCompleted) return;
         _appToNetCompleted = true;
-        _appToNetPipe.Writer.Complete();
+        try { _appToNetPipe.Writer.Complete(); } catch { /* already completed */ }
     }
 
     private void Close()
@@ -341,10 +483,24 @@ internal sealed class LocalTcpConnection(
         if (Interlocked.Exchange(ref _closedFlag, 1) != 0)
             return;
 
-        State = TcpConnectionState.Closed;
+        // Suppress any future FIN emission (RST/idle/double-FIN paths should not send FIN).
+        LocalTcpStream? abandoned;
+        lock (_seqLock)
+        {
+            State = TcpConnectionState.Closed;
+            _finSent = true;
+            abandoned = _pendingStream;
+            _pendingStream = null;
+        }
+
+        // Dispose unaccepted stream if handshake never completed. With _finSent=true above,
+        // the stream's Dispose -> StartFin path is a no-op.
+        abandoned?.Dispose();
+
         CompleteNetToApp();
         CompleteAppToNet();
-        OnClosed?.Invoke(this);
+
+        try { OnClosed?.Invoke(this); } catch { /* ignore subscriber errors */ }
         Dispose();
     }
 }

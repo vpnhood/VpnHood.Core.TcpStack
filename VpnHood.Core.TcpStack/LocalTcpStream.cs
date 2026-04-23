@@ -135,24 +135,19 @@ public sealed class LocalTcpStream : Stream
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return;
-            
-        if (disposing)
-        {
-            _cts.Cancel();
-            _connection.StartFin(_stack);
+
+        if (disposing) {
+            try { _cts.Cancel(); } catch { /* ignore */ }
+            try { _connection.StartFin(_stack); } catch { /* ignore */ }
             _cts.Dispose();
         }
         base.Dispose(disposing);
     }
 
     /// <inheritdoc />
-    public override async ValueTask DisposeAsync()
+    public override ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0)
-            return;
-
-        await _cts.CancelAsync();
-        _connection.StartFin(_stack);
-        _cts.Dispose();
+        Dispose(true);
+        return ValueTask.CompletedTask;
     }
 }

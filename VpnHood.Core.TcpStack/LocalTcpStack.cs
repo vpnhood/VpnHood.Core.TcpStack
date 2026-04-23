@@ -12,6 +12,12 @@ namespace VpnHood.Core.TcpStack;
 /// A lightweight, localhost-only TCP stack implementation designed for VpnHood's TunVpnAdapter.
 /// This stack is optimized for local loopback connections where packet loss is not expected.
 /// </summary>
+/// <remarks>
+/// IMPORTANT: <see cref="OnPacketSend"/> hands ownership of the produced <see cref="IpPacket"/>
+/// to the consumer. The consumer is responsible for disposing it (the WinDivert adapter does
+/// this automatically when AutoDisposePackets = true). When no consumer is registered, the
+/// stack disposes the packet itself to release pooled memory.
+/// </remarks>
 public sealed class LocalTcpStack : IDisposable
 {
     // Fixed window size for loopback - no need for large windows since transfer is instant
@@ -19,11 +25,12 @@ public sealed class LocalTcpStack : IDisposable
 
     private readonly ConcurrentDictionary<IpEndPointQuad, LocalTcpConnection> _connections = new();
     private readonly ConcurrentDictionary<IpEndPointValue, LocalTcpListener> _listeners = new();
+    private readonly Lock _anyListenerLock = new();
     private LocalTcpListener? _anyListener;
     private bool _disposed;
 
     /// <summary>
-    /// Callback invoked when a TCP packet needs to be sent out.
+    /// Callback invoked when a TCP packet needs to be sent out. The callback takes ownership of the packet.
     /// </summary>
     public Action<IpPacket>? OnPacketSend { get; set; }
 
@@ -33,8 +40,7 @@ public sealed class LocalTcpStack : IDisposable
     public LocalTcpListener Listen(IpEndPointValue localEndPoint)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var ipEndPoint = new IpEndPointValue(localEndPoint.Address, localEndPoint.Port);
-        return _listeners.GetOrAdd(ipEndPoint, _ => new LocalTcpListener(this, localEndPoint));
+        return _listeners.GetOrAdd(localEndPoint, ep => new LocalTcpListener(this, ep));
     }
 
     /// <summary>
@@ -43,7 +49,9 @@ public sealed class LocalTcpStack : IDisposable
     public LocalTcpListener ListenAny()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        return _anyListener ??= new LocalTcpListener(this, null);
+        lock (_anyListenerLock) {
+            return _anyListener ??= new LocalTcpListener(this, null);
+        }
     }
 
     public bool StopListening(IPEndPoint localEndPoint)
@@ -56,8 +64,7 @@ public sealed class LocalTcpStack : IDisposable
     /// </summary>
     public bool StopListening(IpEndPointValue localEndPoint)
     {
-        var endPointStruct = new IpEndPointValue(localEndPoint.Address, localEndPoint.Port);
-        return _listeners.TryRemove(endPointStruct, out _);
+        return _listeners.TryRemove(localEndPoint, out _);
     }
 
     /// <summary>
@@ -65,129 +72,139 @@ public sealed class LocalTcpStack : IDisposable
     /// </summary>
     internal bool StopListeningAny()
     {
-        if (_anyListener == null)
-            return false;
+        lock (_anyListenerLock) {
+            if (_anyListener == null)
+                return false;
 
-        _anyListener = null;
-        return true;
+            _anyListener = null;
+            return true;
+        }
     }
 
     /// <summary>
-    /// Processes an incoming IP packet that may contain TCP data.
+    /// Processes an incoming IP packet. The bytes are copied into a pooled buffer; the original
+    /// span is not retained, and the pooled buffer is released before this method returns.
     /// </summary>
     public void ProcessIncoming(ReadOnlySpan<byte> packetData)
     {
         if (_disposed)
             return;
 
-        try
-        {
-            var ipPacket = PacketBuilder.Parse(packetData);
-            if (ipPacket.Protocol != IpProtocol.Tcp)
-                return;
-
-            var tcpPacket = ipPacket.ExtractTcp();
-            var ipEndPointQuad = new IpEndPointQuad(
-                new IpEndPointValue(ipPacket.SourceAddress, tcpPacket.SourcePort),
-                new IpEndPointValue(ipPacket.DestinationAddress, tcpPacket.DestinationPort));
-
-            // Handle SYN packets (new connection requests)
-            if (tcpPacket is { Synchronize: true, Acknowledgment: false })
-            {
-                HandleSynPacket(ipEndPointQuad, tcpPacket);
-                return;
-            }
-
-            // Handle packets for existing connections
-            if (_connections.TryGetValue(ipEndPointQuad, out var existing))
-            {
-                HandleExistingConnection(existing, tcpPacket);
-                return;
-            }
-
-            // Unknown connection - send RST if not already a RST
-            if (!tcpPacket.Reset)
-            {
-                SendRst(ipEndPointQuad.Destination, ipEndPointQuad.Source, tcpPacket);
-            }
+        IpPacket? ipPacket = null;
+        try {
+            ipPacket = PacketBuilder.Parse(packetData);
+            ProcessIncomingInternal(ipPacket);
         }
-        catch
-        {
+        catch {
+            // Silently ignore malformed packets
+        }
+        finally {
+            ipPacket?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Processes an already-parsed incoming IP packet without taking ownership.
+    /// The caller remains responsible for disposing <paramref name="ipPacket"/>.
+    /// </summary>
+    public void ProcessIncoming(IpPacket ipPacket)
+    {
+        if (_disposed)
+            return;
+
+        try {
+            ProcessIncomingInternal(ipPacket);
+        }
+        catch {
             // Silently ignore malformed packets
         }
     }
 
-    private void HandleSynPacket(IpEndPointQuad ipEndPointQuad, TcpPacket tcpPacket)
+    private void ProcessIncomingInternal(IpPacket ipPacket)
     {
-        var listener = ResolveListener(ipEndPointQuad.Destination);
-        if (listener == null)
-        {
-            // No listener - send RST
-            SendRst(ipEndPointQuad.Destination, ipEndPointQuad.Source, tcpPacket);
+        if (ipPacket.Protocol != IpProtocol.Tcp)
+            return;
+
+        var tcpPacket = ipPacket.ExtractTcp();
+        var endPointQuad = new IpEndPointQuad(
+            new IpEndPointValue(ipPacket.SourceAddress, tcpPacket.SourcePort),
+            new IpEndPointValue(ipPacket.DestinationAddress, tcpPacket.DestinationPort));
+
+        // Handle SYN packets (new connection requests)
+        if (tcpPacket is { Synchronize: true, Acknowledgment: false }) {
+            HandleSynPacket(endPointQuad, tcpPacket);
             return;
         }
 
-        // Check if connection already exists (SYN retransmit)
-        if (_connections.TryGetValue(ipEndPointQuad, out var existingConn))
-        {
-            // SYN retransmit - resend SYN-ACK
+        // Handle packets for existing connections
+        if (_connections.TryGetValue(endPointQuad, out var existing)) {
+            HandleExistingConnection(existing, tcpPacket);
+            return;
+        }
+
+        // Unknown connection - send RST if not already an RST
+        if (!tcpPacket.Reset)
+            SendRst(endPointQuad.Destination, endPointQuad.Source, tcpPacket);
+    }
+
+    private void HandleSynPacket(IpEndPointQuad endPointQuad, TcpPacket tcpPacket)
+    {
+        var listener = ResolveListener(endPointQuad.Destination);
+        if (listener == null) {
+            // No listener - send RST
+            SendRst(endPointQuad.Destination, endPointQuad.Source, tcpPacket);
+            return;
+        }
+
+        // SYN retransmit for a connection that's still in SynReceived: re-send SYN-ACK
+        if (_connections.TryGetValue(endPointQuad, out var existingConn)) {
             if (existingConn.State == TcpConnectionState.SynReceived)
-            {
-                var synAckPacket = PacketBuilder.BuildTcp(ipEndPointQuad.Destination, ipEndPointQuad.Source,
-                    ReadOnlySpan<byte>.Empty,
-                    ReadOnlySpan<byte>.Empty);
-
-                var synAckTcp = synAckPacket.ExtractTcp();
-                synAckTcp.SequenceNumber = existingConn.SndNxt - 1; // SYN seq was SndNxt - 1
-                synAckTcp.AcknowledgmentNumber = existingConn.RcvNxt;
-                synAckTcp.Synchronize = true;
-                synAckTcp.Acknowledgment = true;
-                synAckTcp.WindowSize = LoopbackWindowSize;
-
-                SendPacket(synAckPacket);
-            }
+                SendSynAck(existingConn);
             return;
         }
 
         var isnLocal = (uint)RandomNumberGenerator.GetInt32(int.MaxValue);
-        var tcpConnection = new LocalTcpConnection(ipEndPointQuad, isnLocal, tcpPacket.SequenceNumber);
+        var peerMss = ParseMssOption(tcpPacket.Options.Span);
+        var connection = new LocalTcpConnection(endPointQuad, isnLocal, tcpPacket.SequenceNumber, peerMss, listener);
+        connection.OnClosed += OnConnectionClosed;
 
-        // Subscribe to connection close event for cleanup
-        tcpConnection.OnClosed += OnConnectionClosed;
-
-        if (!_connections.TryAdd(ipEndPointQuad, tcpConnection))
-        {
-            tcpConnection.Dispose();
+        if (!_connections.TryAdd(endPointQuad, connection)) {
+            connection.Dispose();
             return;
         }
 
-        listener.EnqueueAccept(tcpConnection);
+        SendSynAck(connection);
 
-        // Send SYN-ACK
-        var synAckPacket2 = PacketBuilder.BuildTcp(
-            ipEndPointQuad.Destination, ipEndPointQuad.Source,
-            ReadOnlySpan<byte>.Empty,
-            ReadOnlySpan<byte>.Empty);
+        // Note: do NOT enqueue accept yet. The listener gets the stream only after the
+        // final ACK arrives and the connection transitions to Established.
+        connection.Start(this);
+    }
 
-        var synAckTcp2 = synAckPacket2.ExtractTcp();
-        synAckTcp2.SequenceNumber = isnLocal;
-        synAckTcp2.AcknowledgmentNumber = tcpPacket.SequenceNumber + 1;
-        synAckTcp2.Synchronize = true;
-        synAckTcp2.Acknowledgment = true;
-        synAckTcp2.WindowSize = LoopbackWindowSize;
+    private void SendSynAck(LocalTcpConnection conn)
+    {
+        var packet = PacketBuilder.BuildTcp(
+            conn.EndPointQuad.Destination, conn.EndPointQuad.Source,
+            options: ReadOnlySpan<byte>.Empty,
+            payload: ReadOnlySpan<byte>.Empty);
 
-        SendPacket(synAckPacket2);
-        tcpConnection.SndNxt += 1; // SYN counts as one sequence number
+        var tcp = packet.ExtractTcp();
+        // Idempotent across SYN retransmits: SndNxt must be ISN+1 once SYN-ACK is sent.
+        conn.SetSndNxtAfterSyn();
+        var (_, rcvNxt) = conn.SnapshotSequence();
+        tcp.SequenceNumber = conn.IsnLocal;
+        tcp.AcknowledgmentNumber = rcvNxt;
+        tcp.Synchronize = true;
+        tcp.Acknowledgment = true;
+        tcp.WindowSize = LoopbackWindowSize;
 
-        // Start background tasks (idle monitor, data pump)
-        tcpConnection.Start(this);
+        SendPacket(packet);
     }
 
     private void HandleExistingConnection(LocalTcpConnection conn, TcpPacket tcpPacket)
     {
-        // Transition from SynReceived to Established on first ACK
+        // Transition from SynReceived to Established on first valid ACK
         if (conn.State == TcpConnectionState.SynReceived && tcpPacket.Acknowledgment)
-            conn.State = TcpConnectionState.Established;
+            conn.MarkEstablished();
 
         var flags = (TcpFlags)0;
         if (tcpPacket.Finish) flags |= TcpFlags.Fin;
@@ -200,48 +217,50 @@ public sealed class LocalTcpStack : IDisposable
             flags,
             tcpPacket.Payload.Span);
 
-        if (!handled)
+        if (!handled || !needsAck)
             return;
 
-        if (!needsAck)
-            return;
+        SendAckOnly(conn);
+    }
 
-        var ackPacket = PacketBuilder.BuildTcp(
+    internal void SendAckOnly(LocalTcpConnection conn)
+    {
+        var packet = PacketBuilder.BuildTcp(
             conn.EndPointQuad.Destination, conn.EndPointQuad.Source,
-            ReadOnlySpan<byte>.Empty,
-            ReadOnlySpan<byte>.Empty);
+            options: ReadOnlySpan<byte>.Empty,
+            payload: ReadOnlySpan<byte>.Empty);
 
-        var ackTcp = ackPacket.ExtractTcp();
-        ackTcp.SequenceNumber = conn.SndNxt;
-        ackTcp.AcknowledgmentNumber = conn.RcvNxt;
-        ackTcp.Acknowledgment = true;
-        ackTcp.WindowSize = LoopbackWindowSize;
+        var tcp = packet.ExtractTcp();
+        var (sndNxt, rcvNxt) = conn.SnapshotSequence();
+        tcp.SequenceNumber = sndNxt;
+        tcp.AcknowledgmentNumber = rcvNxt;
+        tcp.Acknowledgment = true;
+        tcp.WindowSize = LoopbackWindowSize;
 
-        SendPacket(ackPacket);
+        SendPacket(packet);
     }
 
     private void SendRst(IpEndPointValue localEndPoint, IpEndPointValue remoteEndPoint, TcpPacket incomingTcp)
     {
         var rstPacket = PacketBuilder.BuildTcp(
-            localEndPoint.ToIPEndPoint(), remoteEndPoint.ToIPEndPoint(),
-            ReadOnlySpan<byte>.Empty,
-            ReadOnlySpan<byte>.Empty);
+            localEndPoint, remoteEndPoint,
+            options: ReadOnlySpan<byte>.Empty,
+            payload: ReadOnlySpan<byte>.Empty);
 
         var rstTcp = rstPacket.ExtractTcp();
         rstTcp.Reset = true;
 
         // RFC 793: If ACK bit is off, seq = 0, ack = seq + segment length
         // If ACK bit is on, seq = ack number from incoming
-        if (incomingTcp.Acknowledgment)
-        {
+        if (incomingTcp.Acknowledgment) {
             rstTcp.SequenceNumber = incomingTcp.AcknowledgmentNumber;
         }
-        else
-        {
+        else {
             rstTcp.SequenceNumber = 0;
-            rstTcp.AcknowledgmentNumber = incomingTcp.SequenceNumber + (uint)incomingTcp.Payload.Length;
-            if (incomingTcp.Synchronize) rstTcp.AcknowledgmentNumber += 1;
-            if (incomingTcp.Finish) rstTcp.AcknowledgmentNumber += 1;
+            var ackNum = incomingTcp.SequenceNumber + (uint)incomingTcp.Payload.Length;
+            if (incomingTcp.Synchronize) ackNum += 1;
+            if (incomingTcp.Finish) ackNum += 1;
+            rstTcp.AcknowledgmentNumber = ackNum;
             rstTcp.Acknowledgment = true;
         }
 
@@ -253,20 +272,67 @@ public sealed class LocalTcpStack : IDisposable
         _connections.TryRemove(conn.EndPointQuad, out _);
     }
 
+    /// <summary>
+    /// Updates checksums and hands the packet to the consumer. If no consumer is registered the
+    /// pooled buffer is released so we never leak memory.
+    /// </summary>
     internal void SendPacket(IpPacket packet)
     {
-        packet.UpdateAllChecksums();
-        OnPacketSend?.Invoke(packet);
+        var callback = OnPacketSend;
+        if (callback == null) {
+            packet.Dispose();
+            return;
+        }
+
+        try {
+            packet.UpdateAllChecksums();
+            callback(packet);
+        }
+        catch {
+            // If the consumer threw, dispose to avoid leaking the pooled buffer.
+            try { packet.Dispose(); } catch { /* ignore */ }
+            throw;
+        }
     }
 
     private LocalTcpListener? ResolveListener(IpEndPointValue endPoint)
     {
-        // If no specific listeners, use the "any" listener if available
-        if (_listeners.IsEmpty)
-            return _anyListener;
+        // Specific listener wins over wildcard
+        if (_listeners.TryGetValue(endPoint, out var listener))
+            return listener;
 
-        // Try to find a specific listener first
-        return _listeners.TryGetValue(endPoint, out var listener) ? listener : _anyListener;
+        return _anyListener;
+    }
+
+    /// <summary>
+    /// Parses the TCP "Maximum Segment Size" option (kind=2, len=4) from the SYN options.
+    /// Returns null when the option is absent or malformed.
+    /// </summary>
+    private static ushort? ParseMssOption(ReadOnlySpan<byte> options)
+    {
+        var i = 0;
+        while (i < options.Length) {
+            var kind = options[i];
+            switch (kind) {
+                case 0: // End of option list
+                    return null;
+                case 1: // NOP - single byte
+                    i++;
+                    continue;
+            }
+
+            // Multibyte option: must have at least the length byte
+            if (i + 1 >= options.Length) return null;
+            var len = options[i + 1];
+            if (len < 2 || i + len > options.Length) return null;
+
+            if (kind == 2 && len == 4)
+                return (ushort)((options[i + 2] << 8) | options[i + 3]);
+
+            i += len;
+        }
+
+        return null;
     }
 
     public void Dispose()
@@ -276,17 +342,21 @@ public sealed class LocalTcpStack : IDisposable
 
         _disposed = true;
 
-        foreach (var kvp in _listeners)
-        {
+        foreach (var kvp in _listeners) {
             if (_listeners.TryRemove(kvp.Key, out var listener))
                 listener.Dispose();
         }
 
-        _anyListener?.Dispose();
-        _anyListener = null;
+        LocalTcpListener? anyListener;
+        lock (_anyListenerLock) {
+            anyListener = _anyListener;
+            _anyListener = null;
+        }
+        anyListener?.Dispose();
 
-        foreach (var kvp in _connections)
+        foreach (var kvp in _connections) {
             if (_connections.TryRemove(kvp.Key, out var connection))
                 connection.Dispose();
+        }
     }
 }

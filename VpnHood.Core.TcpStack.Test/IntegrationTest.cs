@@ -1,7 +1,6 @@
 ﻿using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.Toolkit.Net;
 using VpnHood.Core.VpnAdapters.Abstractions;
@@ -128,7 +127,7 @@ public sealed class TcpStackIntegrationTest
                         
                         Console.WriteLine($"[SERVER] Echoing {bytesRead} bytes back...");
                         await stream.WriteAsync(buffer, 0, bytesRead);
-                        Console.WriteLine($"[SERVER] Echo complete");
+                        Console.WriteLine("[SERVER] Echo complete");
                     }
                 }
                 catch (Exception ex)
@@ -144,7 +143,7 @@ public sealed class TcpStackIntegrationTest
             // Start adapter
             var options = new VpnAdapterOptions
             {
-                SessionName = "DiagTest",
+                SessionName = "DiagnosticTest",
                 VirtualIpNetworkV4 = IpNetwork.Parse("10.0.0.0/24"),
                 IncludeNetworks = [new IpNetwork(TestServerIp, 32)]
             };
@@ -208,7 +207,7 @@ public sealed class TcpStackIntegrationTest
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\n=== TEST FAILED ===");
+            Console.WriteLine("\n=== TEST FAILED ===");
             Console.WriteLine($"Exception: {ex.GetType().Name}: {ex.Message}");
             Console.WriteLine($"Stack: {ex.StackTrace}");
             
@@ -323,7 +322,7 @@ public sealed class TcpStackIntegrationTest
             };
             
             Console.WriteLine("[TEST] Starting WinDivert adapter...");
-            Console.WriteLine($"[TEST] Include networks: {string.Join<IpNetwork>(", ", options.IncludeNetworks)}");
+            Console.WriteLine($"[TEST] Include networks: {string.Join(", ", options.IncludeNetworks)}");
             await adapter.Start(options, CancellationToken.None);
             Console.WriteLine("[TEST] Adapter started successfully");
             

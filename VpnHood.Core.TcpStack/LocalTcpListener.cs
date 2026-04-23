@@ -13,16 +13,15 @@ public sealed class LocalTcpListener : IDisposable
         new UnboundedChannelOptions { SingleReader = true });
 
     private readonly LocalTcpStack _stack;
-    private bool _stopped;
+    private int _stopped;
 
     /// <summary>
-    /// The local endpoint this listener is bound to.
-    /// Null indicates a wildcard listener that accepts connections on any endpoint (both IPv4 and IPv6).
+    /// The local endpoint this listener is bound to. Null = wildcard listener (any IPv4/IPv6).
     /// </summary>
     public IpEndPointValue? LocalEndPoint { get; }
 
     /// <summary>
-    /// Indicates whether this listener accepts connections on any endpoint.
+    /// True when this listener accepts connections on any endpoint.
     /// </summary>
     public bool IsAny => LocalEndPoint is null;
 
@@ -32,23 +31,19 @@ public sealed class LocalTcpListener : IDisposable
         LocalEndPoint = localEndPoint;
     }
 
-    internal void EnqueueAccept(LocalTcpConnection connection)
+    /// <summary>
+    /// Try to enqueue an accepted stream. Returns false if the listener has been stopped,
+    /// in which case the caller is responsible for disposing the stream.
+    /// </summary>
+    internal bool TryEnqueueAccept(LocalTcpStream stream)
     {
-        if (_stopped) return;
-        
-        var stream = new LocalTcpStream(connection, _stack);
-        if (!_acceptQueue.Writer.TryWrite(stream))
-        {
-            // Queue was completed, dispose the stream
-            stream.Dispose();
-        }
+        if (Volatile.Read(ref _stopped) != 0) return false;
+        return _acceptQueue.Writer.TryWrite(stream);
     }
 
     /// <summary>
     /// Asynchronously accepts all incoming connections.
     /// </summary>
-    /// <param name="cancellationToken">Cancellation token to stop accepting connections.</param>
-    /// <returns>An async enumerable of connected streams.</returns>
     public IAsyncEnumerable<LocalTcpStream> AcceptAllAsync(CancellationToken cancellationToken = default)
     {
         return _acceptQueue.Reader.ReadAllAsync(cancellationToken);
@@ -57,35 +52,30 @@ public sealed class LocalTcpListener : IDisposable
     /// <summary>
     /// Asynchronously accepts a single incoming connection.
     /// </summary>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>The accepted stream.</returns>
-    public async ValueTask<LocalTcpStream> AcceptAsync(CancellationToken cancellationToken = default)
+    public ValueTask<LocalTcpStream> AcceptAsync(CancellationToken cancellationToken = default)
     {
-        return await _acceptQueue.Reader.ReadAsync(cancellationToken);
+        return _acceptQueue.Reader.ReadAsync(cancellationToken);
     }
 
     /// <summary>
-    /// Stops the listener and completes the accept queue.
+    /// Stops the listener and completes the accept queue. Disposes any unaccepted streams.
     /// </summary>
     public void Stop()
     {
-        if (_stopped) return;
-        _stopped = true;
-        
+        if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
+
         _acceptQueue.Writer.TryComplete();
+
         if (LocalEndPoint.HasValue)
             _stack.StopListening(LocalEndPoint.Value);
         else
             _stack.StopListeningAny();
-        
-        // Dispose any unaccepted streams
+
+        // Dispose any unaccepted streams to release their connections.
         while (_acceptQueue.Reader.TryRead(out var stream))
             stream.Dispose();
     }
 
     /// <inheritdoc />
-    public void Dispose()
-    {
-        Stop();
-    }
+    public void Dispose() => Stop();
 }
