@@ -139,7 +139,7 @@ public sealed class LocalTcpStream : Stream
 
         if (disposing) {
             _cts.TryCancel();
-            VhUtils.TryInvoke("SendFin", () => _connection.StartFin(_stack));
+            _connection.TryStartFin(_stack);
             _cts.Dispose();
         }
         base.Dispose(disposing);

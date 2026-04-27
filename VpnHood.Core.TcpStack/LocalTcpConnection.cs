@@ -123,7 +123,7 @@ internal sealed class LocalTcpConnection(
         }
 
         // Now safe to FIN.
-        try { StartFin(stack); } catch { /* ignore */ }
+        TryStartFin(stack);
     }
 
     /// <summary>
@@ -492,6 +492,11 @@ internal sealed class LocalTcpConnection(
 
         if (closeAfter)
             Close();
+    }
+
+    public void TryStartFin(LocalTcpStack stack)
+    {
+        try { StartFin(stack); } catch { /* ignore */ }
     }
 
     private void CompleteNetToApp()
