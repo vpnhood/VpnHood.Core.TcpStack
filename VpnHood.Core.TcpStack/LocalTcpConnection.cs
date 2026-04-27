@@ -503,6 +503,10 @@ internal sealed class LocalTcpConnection(
     {
         if (_netToAppCompleted) return;
         _netToAppCompleted = true;
+
+        // Use synchronous Complete() intentionally: this is an in-memory Pipe, not a
+        // socket/file-backed writer, so completion does not perform async I/O. These
+        // close paths are synchronous and may run from packet/state transition code.
         try { _netToAppPipe.Writer.Complete(); } catch { /* already completed */ }
     }
 
@@ -510,6 +514,10 @@ internal sealed class LocalTcpConnection(
     {
         if (_appToNetCompleted) return;
         _appToNetCompleted = true;
+
+        // Use synchronous Complete() intentionally: this is an in-memory Pipe, not a
+        // socket/file-backed writer, so completion does not perform async I/O. These
+        // close paths are synchronous and may run from packet/state transition code.
         try { _appToNetPipe.Writer.Complete(); } catch { /* already completed */ }
     }
 
