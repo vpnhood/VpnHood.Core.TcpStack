@@ -1,173 +1,152 @@
-# LocalTcpStack - Lightweight TCP Stack for Localhost
+# VpnHood.Core.TcpStack
 
-A lightweight, localhost-only TCP stack implementation in C# designed for integration with VpnHood's TunVpnAdapter. This stack is optimized for local connections where packet loss is not expected and congestion control is not needed.
+A lightweight TCP stack library for .NET, designed to intercept and handle TCP connections inside a VPN adapter (TUN/WinDivert). Optimized for virtual network scenarios where congestion control is unnecessary and packet loss is not expected.
 
 ## Features
 
-- **Lightweight**: Simplified TCP implementation for localhost scenarios
+- **Library**: Pure class library — no executable entry point
 - **Channel-based**: Uses .NET Channels for efficient async data flow
-- **Stream Interface**: Provides standard .NET Stream API through `LocalTcpStream`
-- **Simultaneous Connections**: Supports multiple concurrent TCP connections
-- **VpnHood Integration**: Built to work with existing VpnHood.Core.Packets
-- **No Congestion Control**: Optimized for reliable localhost connections
+- **Stream Interface**: Provides standard .NET `Stream` API via `LocalTcpStream`
+- **Multiple Connections**: Supports concurrent TCP connections
+- **VpnHood Integration**: Works directly with `VpnHood.Core.Packets` and VPN adapters (e.g. WinDivert)
+- **No Congestion Control**: Optimized for reliable virtual/loopback connections
 
 ## Key Components
 
-### LocalTcpStack
-The main TCP stack that processes incoming packets and manages connections.
+### `LocalTcpStack`
+The main TCP stack. Processes raw incoming IP packets and manages connections.
 
 ```csharp
 var tcpStack = new LocalTcpStack();
 
-// Set up packet output callback
-tcpStack.OnPacketSend = packet => 
+// Forward outgoing TCP packets back through the adapter
+tcpStack.OnPacketSend = packet =>
 {
-    // Send packet back to adapter
-    adapter.WritePacket(packet);
+    adapter.SendPacketQueued(packet);
 };
 
-// Process incoming packets
-tcpStack.ProcessIncoming(packetData);
+// Feed incoming packets from the adapter into the stack
+adapter.PacketReceived += (_, packet) =>
+{
+    tcpStack.ProcessIncoming(packet.Buffer.Span);
+};
 ```
 
-### LocalTcpListener
-TCP listener that accepts incoming connections, similar to `TcpListener`.
+### `LocalTcpListener`
+Listens for incoming TCP connections on a virtual endpoint, similar to `TcpListener`.
 
 ```csharp
-var listener = tcpStack.Listen(new IPEndPoint(IPAddress.Loopback, 8080));
+var listener = tcpStack.Listen(new IpEndPointValue(IPAddress.Parse("11.0.0.1"), 8080));
 
-// Accept a single connection
-var stream = await listener.AcceptAsync();
-
-// Or accept all connections using async enumerable
 await foreach (var stream in listener.AcceptAllAsync())
 {
-    // Handle new connection
     _ = Task.Run(() => HandleConnection(stream));
 }
 
-// Stop listening
 listener.Stop();
 ```
 
-### LocalTcpStream
-A standard .NET Stream implementation for TCP connections.
+### `LocalTcpStream`
+A standard .NET `Stream` implementation for each accepted TCP connection.
 
 ```csharp
-// Read data
-var buffer = new byte[1024];
-int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+var buffer = new byte[4096];
+int bytesRead = await stream.ReadAsync(buffer);
 
-// Write data
-await stream.WriteAsync(data, 0, data.Length);
+await stream.WriteAsync(responseData);
 
-// Close connection
-stream.Dispose();
+await stream.DisposeAsync();
 ```
 
-## Integration with TunVpnAdapter
+## Integration with a VPN Adapter
 
-### Step 1: Setup Integration
 ```csharp
 var tcpStack = new LocalTcpStack();
 
-// Integrate with adapter
-tcpStack.IntegrateWithAdapter(packetBytes => 
+// Step 1: Forward outgoing packets from the stack through the adapter
+tcpStack.OnPacketSend = packet =>
 {
-    var packet = PacketBuilder.Parse(packetBytes);
-    adapter.WritePacket(packet);
-});
-```
+    adapter.SendPacketQueued(packet);
+};
 
-### Step 2: Process Incoming Packets
-In your TunVpnAdapter's packet processing:
-
-```csharp
-protected override bool ReadPacket(byte[] buffer)
+// Step 2: Feed packets received by the adapter into the stack
+adapter.PacketReceived += (_, packet) =>
 {
-    // Try to handle with TCP stack first
-    if (tcpStack.TryProcessPacket(buffer))
-        return true;
-        
-    // Continue with normal packet processing
-    return base.ReadPacket(buffer);
-}
-```
+    tcpStack.ProcessIncoming(packet.Buffer.Span);
+};
 
-### Step 3: Start TCP Services
-```csharp
-// Start HTTP server on localhost:8080
-var httpListener = tcpStack.Listen(new IPEndPoint(IPAddress.Loopback, 8080));
+// Step 3: Listen for connections on your virtual IP/port
+var listener = tcpStack.Listen(new IpEndPointValue(IPAddress.Parse("11.0.0.1"), 8080));
 _ = Task.Run(async () =>
 {
-    await foreach (var stream in httpListener.AcceptAllAsync())
+    await foreach (var stream in listener.AcceptAllAsync())
     {
-        _ = Task.Run(() => HandleHttpRequest(stream));
+        _ = Task.Run(() => HandleConnection(stream));
     }
 });
 
-// Start SOCKS proxy on localhost:1080
-var socksListener = tcpStack.Listen(new IPEndPoint(IPAddress.Loopback, 1080));
-_ = Task.Run(async () =>
+// Step 4: Start the adapter, including the virtual IP in IncludeNetworks
+await adapter.Start(new VpnAdapterOptions
 {
-    await foreach (var stream in socksListener.AcceptAllAsync())
-    {
-        _ = Task.Run(() => HandleSocksConnection(stream));
-    }
-});
+    VirtualIpNetworkV4 = IpNetwork.Parse("10.0.0.0/24"),
+    IncludeNetworks = [new IpNetwork(IPAddress.Parse("11.0.0.1"), 32)]
+}, CancellationToken.None);
 ```
 
 ## Example: Echo Server
 
 ```csharp
 var tcpStack = new LocalTcpStack();
-var listener = tcpStack.Listen(new IPEndPoint(IPAddress.Loopback, 8080));
+
+tcpStack.OnPacketSend = packet => adapter.SendPacketQueued(packet);
+adapter.PacketReceived += (_, packet) => tcpStack.ProcessIncoming(packet.Buffer.Span);
+
+var listener = tcpStack.Listen(new IpEndPointValue(IPAddress.Parse("11.0.0.1"), 8080));
 
 await foreach (var stream in listener.AcceptAllAsync())
 {
     _ = Task.Run(async () =>
     {
-        var buffer = new byte[1024];
-        int bytesRead;
-        
-        while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+        try
         {
-            // Echo back the data
-            await stream.WriteAsync(buffer, 0, bytesRead);
+            var buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = await stream.ReadAsync(buffer)) > 0)
+                await stream.WriteAsync(buffer.AsMemory(0, bytesRead));
         }
-        
-        stream.Dispose();
+        finally
+        {
+            await stream.DisposeAsync();
+        }
     });
 }
 ```
 
 ## Architecture
 
-The TCP stack uses the following flow:
-
-1. **Incoming Packets** ? `ProcessIncoming()` ? Parse TCP headers
-2. **SYN Packets** ? Create new `LocalTcpConnection` ? Enqueue in `LocalTcpListener`
-3. **Data Packets** ? Route to existing connection ? Push to app via Channels
-4. **Outgoing Data** ? App writes to `LocalTcpStream` ? Channels ? TCP packets
-5. **TCP Packets** ? `OnPacketSend` callback ? Back to adapter
+```
+Adapter (WinDivert/TUN)
+    |  PacketReceived
+    v
+LocalTcpStack.ProcessIncoming()
+    |  SYN  --> LocalTcpListener (AcceptAllAsync)
+    |  Data --> LocalTcpConnection --> LocalTcpStream (Read)
+    |
+    |  LocalTcpStream (Write)
+    v
+LocalTcpStack.OnPacketSend
+    |
+    v
+Adapter.SendPacketQueued()
+```
 
 ## Limitations
 
-- **Localhost Only**: Designed for 127.0.0.1 traffic only
-- **No Congestion Control**: Assumes reliable, low-latency local connections
-- **Simplified State Machine**: Basic TCP state handling for local scenarios
-- **IPv4 Only**: Currently supports IPv4 addresses only
-- **No TCP Options**: Limited support for TCP options
+- **No Congestion Control**: Designed for virtual/loopback where packet loss does not occur
+- **IPv4 Only**: Currently supports IPv4
+- **Simplified TCP State Machine**: Covers the states needed for reliable local connections
 
 ## Dependencies
 
 - .NET 10.0+
-- VpnHood.Core.Packets
-- System.Threading.Channels
-- System.IO.Pipelines
-
-## Thread Safety
-
-- `LocalTcpStack` is thread-safe for concurrent packet processing
-- `LocalTcpStream` should be used by a single thread for reading/writing
-- `LocalTcpListener` can be safely accessed by multiple threads
+- `VpnHood.Core.Packets`
