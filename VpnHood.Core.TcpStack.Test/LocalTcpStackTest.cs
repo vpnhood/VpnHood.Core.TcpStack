@@ -511,4 +511,109 @@ public sealed class LocalTcpStackTest
         Assert.AreEqual(1001u, dupAckTcp.AcknowledgmentNumber, 
             "Should ACK the expected sequence (indicating gap)");
     }
+
+    /// <summary>
+    /// Tests that the stack handles IPv6 endpoints end-to-end: handshake, data
+    /// in both directions, and that the produced packets are IPv6.
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public async Task IPv6_HandshakeAndDataTransfer_ShouldSucceed()
+    {
+        // Arrange
+        var serverIpV6 = IPAddress.Parse("fd00::1");
+        var clientIpV6 = IPAddress.Parse("fd00::2");
+        const int serverPort = 8080;
+        const int clientPort = 54321;
+
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        object lockObj = new();
+        tcpStack.OnPacketSend = packet =>
+        {
+            lock (lockObj) sentPackets.Add(packet);
+        };
+
+        var listener = tcpStack.Listen(new IpEndPointValue(serverIpV6, serverPort));
+        var acceptTask = AcceptConnectionAsync(listener);
+
+        // Act - SYN
+        var synPacket = CreateTcpPacket(clientIpV6, clientPort, serverIpV6, serverPort, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+
+        // Assert - SYN-ACK is IPv6
+        IpPacket synAckPacket;
+        lock (lockObj) { synAckPacket = sentPackets[0]; }
+        Assert.AreEqual(IpVersion.IPv6, synAckPacket.Version, "Reply must be IPv6");
+        Assert.AreEqual(serverIpV6, synAckPacket.SourceAddress);
+        Assert.AreEqual(clientIpV6, synAckPacket.DestinationAddress);
+        var synAckTcp = synAckPacket.ExtractTcp();
+        Assert.IsTrue(synAckTcp.Synchronize && synAckTcp.Acknowledgment, "Should be SYN-ACK");
+        Assert.AreEqual(1001u, synAckTcp.AcknowledgmentNumber);
+        var serverSeq = synAckTcp.SequenceNumber;
+
+        // Act - final ACK
+        var ackPacket = CreateTcpPacket(clientIpV6, clientPort, serverIpV6, serverPort,
+            ack: true, seq: 1001, ackNum: serverSeq + 1);
+        tcpStack.ProcessIncoming(ackPacket.Buffer.Span);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var stream = await acceptTask.WaitAsync(cts.Token);
+        lock (lockObj) sentPackets.Clear();
+
+        // Act - client sends data
+        var testData = "Hello over IPv6!"u8.ToArray();
+        var dataPacket = CreateTcpPacket(clientIpV6, clientPort, serverIpV6, serverPort,
+            ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
+        tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
+
+        var buffer = new byte[100];
+        var bytesRead = await stream.ReadAsync(buffer, cts.Token);
+        Assert.AreEqual(testData.Length, bytesRead);
+        CollectionAssert.AreEqual(testData, buffer.Take(bytesRead).ToArray());
+
+        // Act - server writes data back
+        lock (lockObj) sentPackets.Clear();
+        var responseData = "World over IPv6!"u8.ToArray();
+        await stream.WriteAsync(responseData, cts.Token);
+        await Task.Delay(100, cts.Token);
+
+        IpPacket[] outgoing;
+        lock (lockObj) { outgoing = sentPackets.ToArray(); }
+        var serverData = outgoing.First(p => p.ExtractTcp().Payload.Length > 0);
+        Assert.AreEqual(IpVersion.IPv6, serverData.Version, "Outgoing data must be IPv6");
+        Assert.AreEqual(serverIpV6, serverData.SourceAddress);
+        Assert.AreEqual(clientIpV6, serverData.DestinationAddress);
+        CollectionAssert.AreEqual(responseData, serverData.ExtractTcp().Payload.ToArray());
+
+        await stream.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Tests that an unknown IPv6 SYN gets an IPv6 RST back.
+    /// </summary>
+    [TestMethod]
+    [Timeout(5000)]
+    public void IPv6_UnknownDestination_ShouldSendIPv6Rst()
+    {
+        // Arrange
+        var serverIpV6 = IPAddress.Parse("fd00::1");
+        var clientIpV6 = IPAddress.Parse("fd00::2");
+
+        var tcpStack = new LocalTcpStack();
+        var sentPackets = new List<IpPacket>();
+        tcpStack.OnPacketSend = sentPackets.Add;
+
+        // Act - SYN to a port nobody listens on
+        var synPacket = CreateTcpPacket(clientIpV6, 54321, serverIpV6, 9999, syn: true, seq: 1000);
+        tcpStack.ProcessIncoming(synPacket.Buffer.Span);
+
+        // Assert - IPv6 RST
+        Assert.AreEqual(1, sentPackets.Count);
+        var rst = sentPackets[0];
+        Assert.AreEqual(IpVersion.IPv6, rst.Version);
+        Assert.AreEqual(serverIpV6, rst.SourceAddress);
+        Assert.AreEqual(clientIpV6, rst.DestinationAddress);
+        Assert.IsTrue(rst.ExtractTcp().Reset);
+    }
 }

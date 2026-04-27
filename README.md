@@ -8,6 +8,7 @@ A lightweight TCP stack library for .NET, designed to intercept and handle TCP c
 - **Channel-based**: Uses .NET Channels for efficient async data flow
 - **Stream Interface**: Provides standard .NET `Stream` API via `LocalTcpStream`
 - **Multiple Connections**: Supports concurrent TCP connections
+- **IPv4 and IPv6**: Address-family agnostic — listeners and connections work transparently with either
 - **VpnHood Integration**: Works directly with `VpnHood.Core.Packets` and VPN adapters (e.g. WinDivert)
 - **No Congestion Control**: Optimized for reliable virtual/loopback connections
 
@@ -143,7 +144,6 @@ Adapter.SendPacketQueued()
 ## Limitations
 
 - **No Congestion Control**: Designed for virtual/loopback where packet loss does not occur
-- **IPv4 Only**: Currently supports IPv4
 - **Simplified TCP State Machine**: Covers the states needed for reliable local connections
 
 ## Dependencies
