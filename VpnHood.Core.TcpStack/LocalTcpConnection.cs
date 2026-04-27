@@ -54,6 +54,7 @@ internal sealed class LocalTcpConnection(
     private long _lastActivityTicks = Stopwatch.GetTimestamp();
     private bool _netToAppCompleted;
     private bool _appToNetCompleted;
+    private Task? _emitTask;
     private uint _sndNxt = isnLocal; // SYN sequence; bumped to ISN+1 after SYN-ACK is sent.
     private uint _rcvNxt = isnRemote + 1; // We have already "consumed" the peer's SYN.
 
@@ -93,7 +94,36 @@ internal sealed class LocalTcpConnection(
         _ = Task.Run(MonitorIdleAsync);
 
         // Start the connection's data pump
-        _ = Task.Run(() => EmitPendingAsync(stack));
+        _emitTask = Task.Run(() => EmitPendingAsync(stack));
+    }
+
+    /// <summary>
+    /// Gracefully closes the connection: stops accepting new app data, waits for the emit pump
+    /// to drain any queued bytes into TCP segments, then sends FIN. Used by
+    /// <see cref="LocalTcpStream.DisposeAsync"/> so closing the stream does not truncate data.
+    /// </summary>
+    public async Task GracefulCloseAsync(LocalTcpStack stack)
+    {
+        if (_disposed) return;
+
+        // Stop accepting more app data; the emit pump will exit naturally when the buffer
+        // is drained and the writer is completed.
+        CompleteAppToNet();
+
+        // Wait for the emit pump to finish so all buffered bytes are turned into TCP segments
+        // before we emit FIN. Bound the wait so a stuck pump can't hang dispose.
+        var emitTask = _emitTask;
+        if (emitTask != null) {
+            try {
+                await emitTask.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch {
+                // Timed out or pump faulted: proceed with FIN anyway.
+            }
+        }
+
+        // Now safe to FIN.
+        try { StartFin(stack); } catch { /* ignore */ }
     }
 
     /// <summary>

@@ -273,6 +273,17 @@ public sealed class LocalTcpStack : IDisposable
     }
 
     /// <summary>
+    /// Closes all currently active connections. New connections can still be accepted afterwards.
+    /// </summary>
+    public void DropAllConnections()
+    {
+        foreach (var kvp in _connections) {
+            if (_connections.TryRemove(kvp.Key, out var connection))
+                connection.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Updates checksums and hands the packet to the consumer. If no consumer is registered the
     /// pooled buffer is released so we never leak memory.
     /// </summary>

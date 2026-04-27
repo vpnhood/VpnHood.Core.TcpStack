@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Net;
+using VpnHood.Core.Toolkit.Utils;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -137,17 +138,26 @@ public sealed class LocalTcpStream : Stream
             return;
 
         if (disposing) {
-            try { _cts.Cancel(); } catch { /* ignore */ }
-            try { _connection.StartFin(_stack); } catch { /* ignore */ }
+            _cts.TryCancel();
+            VhUtils.TryInvoke("SendFin", () => _connection.StartFin(_stack));
             _cts.Dispose();
         }
         base.Dispose(disposing);
     }
 
     /// <inheritdoc />
-    public override ValueTask DisposeAsync()
+    public override async ValueTask DisposeAsync()
     {
-        Dispose(true);
-        return ValueTask.CompletedTask;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        // Graceful close: drain buffered app->net bytes into TCP segments before FIN.
+        await VhUtils.TryInvokeAsync("GracefulCloseAsync", 
+            () => _connection.GracefulCloseAsync(_stack)).ConfigureAwait(false);
+        
+        await _cts.TryCancelAsync();
+        _cts.Dispose();
+
+        base.Dispose(false);
     }
 }
