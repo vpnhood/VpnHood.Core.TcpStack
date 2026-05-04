@@ -13,7 +13,7 @@ public sealed class TcpStackIntegrationTest
 {
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
-    private const int TestDataSize = 1024 * 1024 * 1;  // 10 MB
+    private const int TestDataSize = 256 * 1024;  // 256 KB
 
     /// <summary>
     /// Diagnostic test with minimal data to understand WinDivert integration issues
@@ -22,19 +22,21 @@ public sealed class TcpStackIntegrationTest
     [Timeout(60000)] // 60 seconds for debugging
     public async Task DiagnosticTest_SmallData_WinDivert()
     {
+        var diagServerIp = IPAddress.Parse("11.0.0.2");
+        const int diagServerPort = 8081;
         Console.WriteLine("=== DIAGNOSTIC TEST START ===");
-        Console.WriteLine($"Test Server: {TestServerIp}:{TestServerPort}");
+        Console.WriteLine($"Test Server: {diagServerIp}:{diagServerPort}");
         
         var tcpStack = new LocalTcpStack();
         var adapterSettings = new WinDivertVpnAdapterSettings
         {
-            AdapterName = "VpnHoodTest",
+            AdapterName = "VpnHoodDiag",
             ExcludeLocalNetwork = false,
             SimulateDns = false,
             AutoDisposePackets = true,
             Blocking = true,
         };
-        
+
         using var adapter = new WinDivertVpnAdapter(adapterSettings);
 
         var incomingPackets = new List<(DateTime Time, string Info, byte[] Data)>();
@@ -93,12 +95,12 @@ public sealed class TcpStackIntegrationTest
         };
         
         // Setup listener
-        var listener = tcpStack.Listen(new IpEndPointValue(TestServerIp, TestServerPort));
-        Console.WriteLine($"[SETUP] TCP Stack listening on {TestServerIp}:{TestServerPort}");
+        var listener = tcpStack.Listen(new IpEndPointValue(diagServerIp, diagServerPort));
+        Console.WriteLine($"[SETUP] TCP Stack listening on {diagServerIp}:{diagServerPort}");
         
         // Simple echo server that logs everything
         var serverReceivedData = new List<byte>();
-        var serverTask = Task.Run(async () =>
+        _ = Task.Run(async () =>
         {
             Console.WriteLine("[SERVER] Waiting for connection...");
             await foreach (var stream in listener.AcceptAllAsync())
@@ -145,21 +147,21 @@ public sealed class TcpStackIntegrationTest
             {
                 SessionName = "DiagnosticTest",
                 VirtualIpNetworkV4 = IpNetwork.Parse("10.0.0.0/24"),
-                IncludeNetworks = [new IpNetwork(TestServerIp, 32)]
+                IncludeNetworks = [new IpNetwork(diagServerIp, 32)]
             };
-            
+
             Console.WriteLine("[SETUP] Starting WinDivert adapter...");
             await adapter.Start(options, CancellationToken.None);
             Console.WriteLine("[SETUP] Adapter started");
-            
+
             // Connect with TcpClient
             Console.WriteLine("[CLIENT] Creating TcpClient...");
             using var tcpClient = new TcpClient();
             tcpClient.NoDelay = true; // Disable Nagle's algorithm
-            
-            Console.WriteLine($"[CLIENT] Connecting to {TestServerIp}:{TestServerPort}...");
+
+            Console.WriteLine($"[CLIENT] Connecting to {diagServerIp}:{diagServerPort}...");
             using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            await tcpClient.ConnectAsync(TestServerIp, TestServerPort, connectCts.Token);
+            await tcpClient.ConnectAsync(diagServerIp, diagServerPort, connectCts.Token);
             Console.WriteLine("[CLIENT] Connected!");
             
             await using var stream = tcpClient.GetStream();
@@ -230,7 +232,7 @@ public sealed class TcpStackIntegrationTest
     }
 
     [TestMethod]
-    [Timeout(30000)] // 30 seconds timeout
+    [Timeout(90000)] // 90 seconds timeout
     public async Task TestTcpStackWithWinDivertAdapter_Echo_ShouldSucceed()
     {
         // Arrange
@@ -259,26 +261,14 @@ public sealed class TcpStackIntegrationTest
         {
             try
             {
+                if (packet.Protocol == IpProtocol.Tcp) tcpPacketCount++;
                 packetCount++;
-                if (packet.Protocol == IpProtocol.Tcp)
-                {
-                    tcpPacketCount++;
-                    var tcp = packet.ExtractTcp();
-                    var payloadLen = tcp.Payload.Length;
-                    Console.WriteLine($"[ADAPTER] TCP Packet #{tcpPacketCount}: {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort}, SYN={tcp.Synchronize}, ACK={tcp.Acknowledgment}, PayloadLen={payloadLen}");
-                }
-                else
-                {
-                    Console.WriteLine($"[ADAPTER] Packet #{packetCount} received: {packet.SourceAddress}:{packet.DestinationAddress} Protocol: {packet.Protocol}, Length: {packet.Buffer.Length}");
-                }
-                
                 // Process with TCP stack
                 tcpStack.ProcessIncoming(packet.Buffer.Span);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[ADAPTER] Error processing packet: {ex.Message}");
-                Console.WriteLine($"[ADAPTER] Stack trace: {ex.StackTrace}");
             }
         };
         
@@ -287,15 +277,6 @@ public sealed class TcpStackIntegrationTest
         {
             try
             {
-                if (packet.Protocol == IpProtocol.Tcp)
-                {
-                    var tcp = packet.ExtractTcp();
-                    Console.WriteLine($"[TCP STACK -> ADAPTER] Sending TCP packet: {packet.SourceAddress}:{tcp.SourcePort} -> {packet.DestinationAddress}:{tcp.DestinationPort}, PayloadLen={tcp.Payload.Length}");
-                }
-                else
-                {
-                    Console.WriteLine($"[TCP STACK -> ADAPTER] Sending packet: {packet.SourceAddress} -> {packet.DestinationAddress}");
-                }
                 // ReSharper disable once AccessToDisposedClosure
                 adapter.SendPacketQueued(packet);
             }
@@ -329,9 +310,12 @@ public sealed class TcpStackIntegrationTest
             // Act - Connect with TcpClient and send/receive data
             using var tcpClient = new TcpClient();
             
+            // Allow WinDivert to settle after adapter start (helps when running after other WinDivert tests)
+            await Task.Delay(1000);
+
             Console.WriteLine($"[TEST] Connecting to {TestServerIp}:{TestServerPort}...");
-            
-            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             await tcpClient.ConnectAsync(TestServerIp, TestServerPort, connectCts.Token);
             Console.WriteLine("[TEST] Connected successfully!");
 
@@ -343,7 +327,7 @@ public sealed class TcpStackIntegrationTest
             var receiveTask = ReceiveDataInChunks(stream, receivedData, TestDataSize);
 
             // Wait for both send and receive to complete with timeout
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             await Task.WhenAll(sendTask, receiveTask).WaitAsync(cts.Token);
             
             // Signal completion

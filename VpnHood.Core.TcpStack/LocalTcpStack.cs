@@ -21,7 +21,7 @@ namespace VpnHood.Core.TcpStack;
 public sealed class LocalTcpStack : IDisposable
 {
     // Fixed window size for loopback - no need for large windows since transfer is instant
-    private const ushort LoopbackWindowSize = 16384;
+    private const ushort LoopbackWindowSize = 65535;
 
     private readonly ConcurrentDictionary<IpEndPointQuad, LocalTcpConnection> _connections = new();
     private readonly ConcurrentDictionary<IpEndPointValue, LocalTcpListener> _listeners = new();
@@ -214,6 +214,7 @@ public sealed class LocalTcpStack : IDisposable
         var (handled, needsAck) = conn.TryHandleIncoming(
             tcpPacket.SequenceNumber,
             tcpPacket.AcknowledgmentNumber,
+            tcpPacket.WindowSize,
             flags,
             tcpPacket.Payload.Span);
 
@@ -273,7 +274,7 @@ public sealed class LocalTcpStack : IDisposable
     }
 
     /// <summary>
-    /// Closes all currently active connections. New connections can still be accepted afterwards.
+    /// Closes all currently active connections. New connections can still be accepted afterward.
     /// </summary>
     public void DropAllConnections()
     {

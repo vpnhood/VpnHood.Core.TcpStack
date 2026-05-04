@@ -173,7 +173,7 @@ public sealed class LocalTcpStackTest
         var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
         
         // Start echo server
-        var echoServerTask = Task.Run(async () =>
+        _ = Task.Run(async () =>
         {
             await foreach (var stream in listener.AcceptAllAsync())
             {
@@ -424,7 +424,7 @@ public sealed class LocalTcpStackTest
         // Check window size from SYN-ACK
         var initialWindowSize = synAckTcp.WindowSize;
         Assert.IsTrue(initialWindowSize > 0, "Window should be > 0");
-        Assert.AreEqual(16384, initialWindowSize, "Loopback window should be 16384 (fixed)");
+        Assert.AreEqual(65535, initialWindowSize, "Loopback window should be 65535 (fixed)");
         
         var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
             ack: true, seq: 1001, ackNum: serverSeq + 1);
@@ -548,7 +548,7 @@ public sealed class LocalTcpStackTest
         Assert.AreEqual(serverIpV6, synAckPacket.SourceAddress);
         Assert.AreEqual(clientIpV6, synAckPacket.DestinationAddress);
         var synAckTcp = synAckPacket.ExtractTcp();
-        Assert.IsTrue(synAckTcp.Synchronize && synAckTcp.Acknowledgment, "Should be SYN-ACK");
+        Assert.IsTrue(synAckTcp is { Synchronize: true, Acknowledgment: true }, "Should be SYN-ACK");
         Assert.AreEqual(1001u, synAckTcp.AcknowledgmentNumber);
         var serverSeq = synAckTcp.SequenceNumber;
 
