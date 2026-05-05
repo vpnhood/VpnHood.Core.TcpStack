@@ -195,7 +195,7 @@ public sealed class LocalTcpStack : IDisposable
         tcp.AcknowledgmentNumber = rcvNxt;
         tcp.Synchronize = true;
         tcp.Acknowledgment = true;
-        tcp.WindowSize = LoopbackWindowSize;
+        tcp.WindowSize = conn.CurrentWindowSize;
 
         SendPacket(packet);
     }
@@ -236,7 +236,7 @@ public sealed class LocalTcpStack : IDisposable
         tcp.SequenceNumber = sndNxt;
         tcp.AcknowledgmentNumber = rcvNxt;
         tcp.Acknowledgment = true;
-        tcp.WindowSize = LoopbackWindowSize;
+        tcp.WindowSize = conn.CurrentWindowSize;
 
         SendPacket(packet);
     }

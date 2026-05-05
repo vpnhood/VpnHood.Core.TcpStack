@@ -319,6 +319,7 @@ public sealed class LocalTcpStackTest
         tcp.Reset = rst;
         tcp.SequenceNumber = seq;
         tcp.AcknowledgmentNumber = ackNum;
+        tcp.WindowSize = 65535;
         
         packet.UpdateAllChecksums();
         return packet;

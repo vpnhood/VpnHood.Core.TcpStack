@@ -79,6 +79,7 @@ public sealed class LocalTcpStream : Stream
             var bytesToCopy = (int)Math.Min(buffer.Length, readResult.Buffer.Length);
             readResult.Buffer.Slice(0, bytesToCopy).CopyTo(buffer.Span);
             reader.AdvanceTo(readResult.Buffer.GetPosition(bytesToCopy));
+            _connection.NetToAppConsumed(bytesToCopy);
             
             return bytesToCopy;
         }

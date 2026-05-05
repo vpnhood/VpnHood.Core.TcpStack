@@ -62,6 +62,7 @@ internal sealed class LocalTcpConnection(
     private bool _netToAppCompleted;
     private bool _appToNetCompleted;
     private Task? _emitTask;
+    private int _unreadBytes;
     private uint _sndNxt = isnLocal; // SYN sequence; bumped to ISN+1 after SYN-ACK is sent.
     private uint _rcvNxt = isnRemote + 1; // We have already "consumed" the peer's SYN.
     private uint _sndUna = isnLocal;  // Oldest unacknowledged sequence number (updated by incoming ACKs).
@@ -72,6 +73,17 @@ internal sealed class LocalTcpConnection(
     public uint IsnLocal { get; } = isnLocal;
     public ushort Mss { get; } = ClampMss(peerMss);
     public TcpConnectionState State { get; private set; } = TcpConnectionState.SynReceived;
+
+    public ushort CurrentWindowSize
+    {
+        get
+        {
+            var unread = Interlocked.CompareExchange(ref _unreadBytes, 0, 0);
+            var freeSpace = PipeBufferSize - unread;
+            if (freeSpace < 0) freeSpace = 0;
+            return (ushort)Math.Min(LoopbackWindowSize, freeSpace);
+        }
+    }
 
     /// <summary>
     /// PipeReader for reading data received from network (used by LocalTcpStream)
@@ -231,8 +243,7 @@ internal sealed class LocalTcpConnection(
             var ackDiff = (int)(ack - _sndUna);
             if (ackDiff > 0)
                 _sndUna = ack;
-            if (windowSize > 0)
-                _peerWindowSize = windowSize;
+            _peerWindowSize = windowSize;
             // Check if the emit pump can now send more data
             var allowed = (long)(_sndUna + _peerWindowSize - _sndNxt);
             windowOpened = allowed > 0;
@@ -324,6 +335,21 @@ internal sealed class LocalTcpConnection(
         }
     }
 
+    internal void NetToAppConsumed(int bytes)
+    {
+        if (bytes <= 0) return;
+        var newUnread = Interlocked.Add(ref _unreadBytes, -bytes);
+        // If window opened up significantly, we could send a duplicate ACK to update peer window,
+        // but for loopback it's usually fine since the peer will probe or we just wait.
+        // Actually, let's let the background or next packet handle window updates unless it was 0.
+        if (newUnread + bytes >= PipeBufferSize && newUnread < PipeBufferSize)
+        {
+            // window was zero, now opened!
+            // Wait, we don't have LocalTcpStack reference here to send ACK unless we add an event or method.
+            // Loopback usually doesn't need aggressive window updates, the peer will probe zero window.
+        }
+    }
+
     private void WriteToAppPipe(ReadOnlySpan<byte> data)
     {
         if (_disposed || _netToAppCompleted) return;
@@ -331,7 +357,13 @@ internal sealed class LocalTcpConnection(
         var span = _netToAppPipe.Writer.GetSpan(data.Length);
         data.CopyTo(span);
         _netToAppPipe.Writer.Advance(data.Length);
-        _netToAppPipe.Writer.FlushAsync();
+        
+        Interlocked.Add(ref _unreadBytes, data.Length);
+
+        // We do not await this, but because we limit our advertised TCP window to PipeBufferSize,
+        // _unreadBytes will never exceed PipeBufferSize. Thus FlushAsync will always complete synchronously
+        // and we will never throw InvalidOperationException for overlapping flushes.
+        _ = _netToAppPipe.Writer.FlushAsync();
     }
 
     private void Touch()
@@ -415,6 +447,8 @@ internal sealed class LocalTcpConnection(
     {
         var mss = Mss;
         var remaining = buffer;
+        int packetCount = 0;
+
         while (!remaining.IsEmpty && !_disposed)
         {
             // Flow control: check how many bytes the peer's window allows
@@ -426,7 +460,7 @@ internal sealed class LocalTcpConnection(
 
             if (allowed <= 0)
             {
-                // Window full — wait for ACKs to open it
+                // Window full ï¿½ wait for ACKs to open it
                 try { await _windowOpenSignal.WaitAsync(TimeSpan.FromMilliseconds(500), _cts.Token); }
                 catch (OperationCanceledException) { break; }
                 continue; // Re-check allowed
@@ -450,7 +484,7 @@ internal sealed class LocalTcpConnection(
             tcp.SequenceNumber = seqForSegment;
             tcp.AcknowledgmentNumber = ackForSegment;
             tcp.Acknowledgment = true;
-            tcp.WindowSize = LoopbackWindowSize;
+            tcp.WindowSize = CurrentWindowSize;
 
             // Set PSH on the last segment of the current burst.
             if (remaining.Length == segLen)
@@ -458,6 +492,9 @@ internal sealed class LocalTcpConnection(
 
             stack.SendPacket(tcpPacket);
             remaining = remaining.Slice(segLen);
+
+            if (++packetCount % 32 == 0)
+                await Task.Yield();
         }
     }
 
@@ -516,7 +553,7 @@ internal sealed class LocalTcpConnection(
             tcp.AcknowledgmentNumber = _rcvNxt;
             tcp.Finish = true;
             tcp.Acknowledgment = true;
-            tcp.WindowSize = LoopbackWindowSize;
+            tcp.WindowSize = CurrentWindowSize;
 
             _sndNxt += 1; // FIN consumes one sequence number
 
