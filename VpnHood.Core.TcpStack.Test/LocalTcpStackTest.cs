@@ -89,6 +89,8 @@ public sealed class LocalTcpStackTest
             ack: true, psh: true, seq: 1001, ackNum: serverSeq + 1, payload: testData);
         tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
 
+        await WaitForCondition(() => sentPackets.Count >= 1, cts.Token);
+
         // Assert - Should receive data ACK
         Assert.IsTrue(sentPackets.Count >= 1, "Should send ACK for data");
         
@@ -425,7 +427,7 @@ public sealed class LocalTcpStackTest
         // Check window size from SYN-ACK
         var initialWindowSize = synAckTcp.WindowSize;
         Assert.IsTrue(initialWindowSize > 0, "Window should be > 0");
-        Assert.AreEqual(65535, initialWindowSize, "Loopback window should be 65535 (fixed)");
+        Assert.AreEqual(32768, initialWindowSize, "Loopback window should be scaled (32768)");
         
         var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
             ack: true, seq: 1001, ackNum: serverSeq + 1);
@@ -449,9 +451,11 @@ public sealed class LocalTcpStackTest
         lock (lockObj) { ackResponse = sentPackets.First(p => p.ExtractTcp().Acknowledgment); }
         var windowAfterData = ackResponse.ExtractTcp().WindowSize;
         
-        // Window should be same fixed value (pipe backpressure handles flow control internally)
-        Assert.AreEqual(initialWindowSize, windowAfterData, 
-            "Window should remain fixed for loopback - pipe backpressure handles flow control");
+        // Window should reflect free pipe space (PipeBufferSize - unread) >> windowScale.
+        // After receiving 1000 bytes (unread), window will be slightly less than initial.
+        Assert.IsTrue(windowAfterData < initialWindowSize,
+            $"Window should shrink after receiving data; before={initialWindowSize}, after={windowAfterData}");
+        Assert.IsTrue(windowAfterData > 0, "Window should still be positive");
 
         await stream.DisposeAsync();
     }
@@ -616,5 +620,12 @@ public sealed class LocalTcpStackTest
         Assert.AreEqual(serverIpV6, rst.SourceAddress);
         Assert.AreEqual(clientIpV6, rst.DestinationAddress);
         Assert.IsTrue(rst.ExtractTcp().Reset);
+    }
+
+    private static async Task WaitForCondition(Func<bool> condition, CancellationToken ct, int timeoutMs = 1000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition() && sw.ElapsedMilliseconds < timeoutMs)
+            await Task.Delay(5, ct);
     }
 }

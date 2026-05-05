@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<Description>lwIP-based TCP stack provider for VpnHood TcpStack.</Description>
+		<TargetFramework>net10.0</TargetFramework>
+	</PropertyGroup>
+
+	<PropertyGroup>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\VpnHood.Core.TcpStack\VpnHood.Core.TcpStack.csproj" />
+	</ItemGroup>
+
+	<!-- Include native DLL as content so it gets copied to output -->
+	<ItemGroup>
+		<None Include="runtimes\win-x64\native\liblwip_shim.dll" Pack="true" PackagePath="runtimes/win-x64/native/">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<Link>liblwip_shim.dll</Link>
+		</None>
+	</ItemGroup>
+</Project>
