@@ -13,6 +13,7 @@
 
 	<ItemGroup>
 		<ProjectReference Include="..\VpnHood.Core.TcpStack\VpnHood.Core.TcpStack.csproj" />
+		<ProjectReference Include="..\VpnHood.Core.TcpStack.Abstractions\VpnHood.Core.TcpStack.Abstractions.csproj" />
 	</ItemGroup>
 
 	<!-- Include native DLL as content so it gets copied to output -->

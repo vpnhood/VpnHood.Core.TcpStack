@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Net;
+using VpnHood.Core.TcpStack.Abstractions;
 using VpnHood.Core.Toolkit.Utils;
 
 namespace VpnHood.Core.TcpStack;
@@ -8,14 +9,15 @@ namespace VpnHood.Core.TcpStack;
 /// A standard .NET Stream implementation for TCP connections through the local TCP stack.
 /// Provides async read/write operations over TCP connections using System.IO.Pipelines for efficiency.
 /// </summary>
-public sealed class LocalTcpStream : Stream
+public sealed class LocalTcpStream : Stream, ITcpClient
 {
     private readonly LocalTcpConnection _connection;
     private readonly LocalTcpStack _stack;
     private readonly CancellationTokenSource _cts = new();
     private int _disposed;
-    public IPEndPoint LocalEndPoint { get; } 
+    public IPEndPoint LocalEndPoint { get; }
     public IPEndPoint RemoteEndPoint { get; }
+    Stream ITcpClient.Stream => this;
 
     internal LocalTcpStream(LocalTcpConnection connection, LocalTcpStack stack)
     {

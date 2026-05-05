@@ -1,18 +1,20 @@
 using System.Buffers;
 using System.Net;
+using VpnHood.Core.TcpStack.Abstractions;
 
 namespace VpnHood.Core.TcpStack.LwIP;
 
 /// <summary>
 /// A standard .NET Stream implementation for TCP connections through the lwIP stack.
 /// </summary>
-public sealed class LwipTcpStream : Stream
+public sealed class LwipTcpStream : Stream, ITcpClient
 {
     private readonly LwipTcpConnection _connection;
     private int _disposed;
 
     public IPEndPoint LocalEndPoint { get; }
     public IPEndPoint RemoteEndPoint { get; }
+    Stream ITcpClient.Stream => this;
 
     internal LwipTcpStream(LwipTcpConnection connection, IPEndPoint localEp, IPEndPoint remoteEp)
     {

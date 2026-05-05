@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using VpnHood.Core.TcpStack.Abstractions;
 using VpnHood.Core.Toolkit.Net;
 
 namespace VpnHood.Core.TcpStack;
@@ -7,7 +8,7 @@ namespace VpnHood.Core.TcpStack;
 /// TCP listener that accepts incoming connections on a local endpoint.
 /// Similar to <see cref="System.Net.Sockets.TcpListener"/> but for the local TCP stack.
 /// </summary>
-public sealed class LocalTcpListener : IDisposable
+public sealed class LocalTcpListener : ITcpListener
 {
     private readonly Channel<LocalTcpStream> _acceptQueue = Channel.CreateUnbounded<LocalTcpStream>(
         new UnboundedChannelOptions { SingleReader = true });
@@ -49,12 +50,23 @@ public sealed class LocalTcpListener : IDisposable
         return _acceptQueue.Reader.ReadAllAsync(cancellationToken);
     }
 
+    async IAsyncEnumerable<ITcpClient> ITcpListener.AcceptAllAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var stream in AcceptAllAsync(cancellationToken).ConfigureAwait(false))
+            yield return stream;
+    }
+
     /// <summary>
     /// Asynchronously accepts a single incoming connection.
     /// </summary>
     public ValueTask<LocalTcpStream> AcceptAsync(CancellationToken cancellationToken = default)
     {
         return _acceptQueue.Reader.ReadAsync(cancellationToken);
+    }
+
+    async ValueTask<ITcpClient> ITcpListener.AcceptAsync(CancellationToken cancellationToken)
+    {
+        return await AcceptAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

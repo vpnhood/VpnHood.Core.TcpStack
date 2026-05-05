@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
+using VpnHood.Core.TcpStack.Abstractions;
 using VpnHood.Core.Toolkit.Net;
 
 namespace VpnHood.Core.TcpStack.LwIP;
@@ -13,13 +14,15 @@ namespace VpnHood.Core.TcpStack.LwIP;
 /// Provides the same listener/stream pattern as <see cref="LocalTcpStack"/>
 /// but delegates TCP state management to lwIP.
 /// </summary>
-public sealed class LwipTcpStack : IDisposable
+public sealed class LwipTcpStack : IDisposable, ITcpStack
 {
     private readonly nint _stack;
     private readonly ConcurrentDictionary<nint, LwipTcpConnection> _connections = new();
     private readonly Channel<LwipTcpStream> _acceptQueue = Channel.CreateUnbounded<LwipTcpStream>(
         new UnboundedChannelOptions { SingleReader = false });
+    private readonly Lock _listenerLock = new();
     private readonly Timer _pollTimer;
+    private LwipTcpListener? _tcpListener;
     private nint _listener;
     private bool _disposed;
 
@@ -64,11 +67,29 @@ public sealed class LwipTcpStack : IDisposable
     /// <summary>
     /// Starts listening for incoming TCP connections on any address/port.
     /// </summary>
-    public void ListenAny()
+    public LwipTcpListener ListenAny()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_listener != 0) return;
-        _listener = LwipNative.ListenAny(_stack);
+        lock (_listenerLock) {
+            if (_tcpListener != null) return _tcpListener;
+            if (_listener == 0)
+                _listener = LwipNative.ListenAny(_stack);
+            _tcpListener = new LwipTcpListener(this, _acceptQueue);
+            return _tcpListener;
+        }
+    }
+
+    ITcpListener ITcpStack.ListenAny() => ListenAny();
+
+    internal void StopListening()
+    {
+        lock (_listenerLock) {
+            _tcpListener = null;
+            if (_listener != 0) {
+                LwipNative.StopListen(_stack, _listener);
+                _listener = 0;
+            }
+        }
     }
 
     /// <summary>
@@ -76,7 +97,7 @@ public sealed class LwipTcpStack : IDisposable
     /// </summary>
     public IAsyncEnumerable<LwipTcpStream> AcceptAllAsync(CancellationToken cancellationToken = default)
     {
-        return _acceptQueue.Reader.ReadAllAsync(cancellationToken);
+        return ListenAny().AcceptAllAsync(cancellationToken);
     }
 
     /// <summary>
@@ -84,7 +105,7 @@ public sealed class LwipTcpStack : IDisposable
     /// </summary>
     public ValueTask<LwipTcpStream> AcceptAsync(CancellationToken cancellationToken = default)
     {
-        return _acceptQueue.Reader.ReadAsync(cancellationToken);
+        return ListenAny().AcceptAsync(cancellationToken);
     }
 
     /// <summary>
@@ -164,9 +185,13 @@ public sealed class LwipTcpStack : IDisposable
         _disposed = true;
 
         _pollTimer.Dispose();
-        _acceptQueue.Writer.TryComplete();
 
-        // Dispose unaccepted streams
+        // Stop the listener (completes the accept queue and stops native listening)
+        _tcpListener?.Stop();
+        _tcpListener = null;
+
+        // Ensure accept queue is completed even if no listener was created
+        _acceptQueue.Writer.TryComplete();
         while (_acceptQueue.Reader.TryRead(out var stream))
             stream.Dispose();
 
@@ -176,6 +201,7 @@ public sealed class LwipTcpStack : IDisposable
         }
         _connections.Clear();
 
+        // Stop any native listener not managed by LwipTcpListener
         if (_listener != 0) {
             LwipNative.StopListen(_stack, _listener);
             _listener = 0;
@@ -236,7 +262,6 @@ public sealed class LwipTcpStack : IDisposable
 
         var stream = new LwipTcpStream(connection, localEp, remoteEp);
         _acceptQueue.Writer.TryWrite(stream);
-
         // Return connection handle as the "user context" for recv/closed callbacks
         var gcHandle = GCHandle.Alloc(connection);
         return GCHandle.ToIntPtr(gcHandle);

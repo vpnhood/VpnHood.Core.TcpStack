@@ -3,6 +3,7 @@ using System.Net;
 using System.Security.Cryptography;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
+using VpnHood.Core.TcpStack.Abstractions;
 using VpnHood.Core.TcpStack.Primitives;
 using VpnHood.Core.Toolkit.Net;
 
@@ -18,7 +19,7 @@ namespace VpnHood.Core.TcpStack;
 /// this automatically when AutoDisposePackets = true). When no consumer is registered, the
 /// stack disposes the packet itself to release pooled memory.
 /// </remarks>
-public sealed class LocalTcpStack : IDisposable
+public sealed class LocalTcpStack : IDisposable, ITcpStack
 {
     // Fixed window size for loopback - no need for large windows since transfer is instant
     private const ushort LoopbackWindowSize = 16384;
@@ -53,6 +54,8 @@ public sealed class LocalTcpStack : IDisposable
             return _anyListener ??= new LocalTcpListener(this, null);
         }
     }
+
+    ITcpListener ITcpStack.ListenAny() => ListenAny();
 
     public bool StopListening(IPEndPoint localEndPoint)
     {
