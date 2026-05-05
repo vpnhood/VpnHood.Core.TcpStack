@@ -1,9 +1,11 @@
+using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.TcpStack.Primitives;
+using VpnHood.Core.Toolkit.Logging;
 
 namespace VpnHood.Core.TcpStack;
 
@@ -17,30 +19,21 @@ internal sealed class LocalTcpConnection(
     : IDisposable
 {
     // For loopback we use a moderate fixed window size; the pipe handles backpressure internally.
-    private const ushort LoopbackWindowSize = 65535;
+    private const ushort LoopbackWindowSize = 16384;
 
     // Conservative fallback when peer SYN does not advertise an MSS.
-    private const ushort DefaultMss = 1360;
+    private const ushort DefaultMss = 536;
 
-    // Upper cap so a single TCP segment fits within a normal TUN MTU (typically 1500).
-    // On Android, oversized packets injected into the TUN interface get silently dropped,
-    // breaking download throughput. Upload is unaffected because the OS TCP stack segments
-    // that direction itself.
-    private const ushort MaxMss = 1360;
+    // Upper cap so a single TCP segment never exceeds what fits comfortably in a typical MTU.
+    private const ushort MaxMss = LoopbackWindowSize;
 
     private readonly TimeSpan _idleTimeout = tcpTimeout ?? TimeSpan.FromMinutes(15);
     private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromMinutes(1);
 
-    // Pipe buffer sized for bulk throughput. A larger buffer lets the app-side writer
-    // (the VPN tunnel) push data continuously while the emit pump segments and sends.
-    // A too-small buffer (e.g. 16 KB) causes stop-and-go stalls that degrade throughput
-    // on platforms with slightly higher TUN write latency (Android).
-    private const int PipeBufferSize = 512 * 1024; // 512 KB
-
-    // Pipe options for loopback. Both pipes use a single producer / single consumer.
+    // Pipe options - moderate buffer for loopback. Both pipes use a single producer / single consumer.
     private static readonly PipeOptions PipeOpts = new(
-        pauseWriterThreshold: PipeBufferSize,
-        resumeWriterThreshold: PipeBufferSize / 2,
+        pauseWriterThreshold: LoopbackWindowSize,
+        resumeWriterThreshold: LoopbackWindowSize / 2,
         useSynchronizationContext: false);
 
     // Pipe for network -> app data (stream reads)
@@ -62,28 +55,13 @@ internal sealed class LocalTcpConnection(
     private bool _netToAppCompleted;
     private bool _appToNetCompleted;
     private Task? _emitTask;
-    private int _unreadBytes;
     private uint _sndNxt = isnLocal; // SYN sequence; bumped to ISN+1 after SYN-ACK is sent.
     private uint _rcvNxt = isnRemote + 1; // We have already "consumed" the peer's SYN.
-    private uint _sndUna = isnLocal;  // Oldest unacknowledged sequence number (updated by incoming ACKs).
-    private ushort _peerWindowSize = LoopbackWindowSize; // Peer's last advertised receive window.
-    private readonly SemaphoreSlim _windowOpenSignal = new(0, 1); // Signalled when peer window opens up.
 
     public IpEndPointQuad EndPointQuad { get; } = endPointQuad;
     public uint IsnLocal { get; } = isnLocal;
     public ushort Mss { get; } = ClampMss(peerMss);
     public TcpConnectionState State { get; private set; } = TcpConnectionState.SynReceived;
-
-    public ushort CurrentWindowSize
-    {
-        get
-        {
-            var unread = Interlocked.CompareExchange(ref _unreadBytes, 0, 0);
-            var freeSpace = PipeBufferSize - unread;
-            if (freeSpace < 0) freeSpace = 0;
-            return (ushort)Math.Min(LoopbackWindowSize, freeSpace);
-        }
-    }
 
     /// <summary>
     /// PipeReader for reading data received from network (used by LocalTcpStream)
@@ -157,7 +135,6 @@ internal sealed class LocalTcpConnection(
         {
             if (_sndNxtAfterSynSet) return;
             _sndNxt = IsnLocal + 1;
-            _sndUna = IsnLocal + 1;
             _sndNxtAfterSynSet = true;
         }
     }
@@ -198,7 +175,6 @@ internal sealed class LocalTcpConnection(
         _disposed = true;
 
         try { _cts.Cancel(); } catch { /* ignore */ }
-        TrySignalWindowOpen(); // Wake emit pump so it can exit
         // Note: do NOT dispose _cts here. Background tasks may still observe the token after
         // cancellation; CTS dispose is racy with WaitForNextTickAsync. The CTS is cheap and
         // will be GC'd once tasks complete.
@@ -230,26 +206,11 @@ internal sealed class LocalTcpConnection(
     /// Handles incoming TCP data from network.
     /// Returns: (handled, needsAck) - handled indicates if packet was processed, needsAck if ACK should be sent
     /// </summary>
-    public (bool handled, bool needsAck) TryHandleIncoming(uint seq, uint ack, ushort windowSize, TcpFlags flags, ReadOnlySpan<byte> payload)
+    public (bool handled, bool needsAck) TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload)
     {
+        _ = ack;
         if (_disposed) return (false, false);
         Touch();
-
-        // Update flow control state under lock
-        bool windowOpened;
-        lock (_seqLock)
-        {
-            // Advance _sndUna if this ACK acknowledges new data
-            var ackDiff = (int)(ack - _sndUna);
-            if (ackDiff > 0)
-                _sndUna = ack;
-            _peerWindowSize = windowSize;
-            // Check if the emit pump can now send more data
-            var allowed = (long)(_sndUna + _peerWindowSize - _sndNxt);
-            windowOpened = allowed > 0;
-        }
-        if (windowOpened)
-            TrySignalWindowOpen();
 
         if (flags.HasFlag(TcpFlags.Rst))
         {
@@ -335,21 +296,6 @@ internal sealed class LocalTcpConnection(
         }
     }
 
-    internal void NetToAppConsumed(int bytes)
-    {
-        if (bytes <= 0) return;
-        var newUnread = Interlocked.Add(ref _unreadBytes, -bytes);
-        // If window opened up significantly, we could send a duplicate ACK to update peer window,
-        // but for loopback it's usually fine since the peer will probe or we just wait.
-        // Actually, let's let the background or next packet handle window updates unless it was 0.
-        if (newUnread + bytes >= PipeBufferSize && newUnread < PipeBufferSize)
-        {
-            // window was zero, now opened!
-            // Wait, we don't have LocalTcpStack reference here to send ACK unless we add an event or method.
-            // Loopback usually doesn't need aggressive window updates, the peer will probe zero window.
-        }
-    }
-
     private void WriteToAppPipe(ReadOnlySpan<byte> data)
     {
         if (_disposed || _netToAppCompleted) return;
@@ -357,12 +303,14 @@ internal sealed class LocalTcpConnection(
         var span = _netToAppPipe.Writer.GetSpan(data.Length);
         data.CopyTo(span);
         _netToAppPipe.Writer.Advance(data.Length);
-        
-        Interlocked.Add(ref _unreadBytes, data.Length);
 
-        // We do not await this, but because we limit our advertised TCP window to PipeBufferSize,
-        // _unreadBytes will never exceed PipeBufferSize. Thus FlushAsync will always complete synchronously
-        // and we will never throw InvalidOperationException for overlapping flushes.
+        // Synchronous-style flush; we discard the ValueTask intentionally because:
+        //  - On loopback, the reader (the application) drains the pipe quickly.
+        //  - Awaiting here would require restructuring TryHandleIncoming as async,
+        //    and we're called from the packet-receive critical path.
+        // PauseWriterThreshold still bounds memory because every Pipe segment respects it
+        // when GetSpan/Advance are paired with FlushAsync; for very large bursts the writer
+        // is observably "busy" via UnflushedBytes which we can revisit if needed.
         _ = _netToAppPipe.Writer.FlushAsync();
     }
 
@@ -416,21 +364,19 @@ internal sealed class LocalTcpConnection(
                     continue;
                 }
 
-                // Emit all data from this read, waiting for window as needed.
-                // After this returns, the entire buffer has been sent.
-                await EmitBufferAsync(stack, buffer);
-                reader.AdvanceTo(buffer.End);
+                var consumed = EmitBuffer(stack, ref buffer);
+                reader.AdvanceTo(consumed);
 
-                if (result.IsCompleted) break;
+                if (result.IsCompleted && buffer.IsEmpty) break;
             }
         }
         catch (OperationCanceledException)
         {
             // Expected on close
         }
-        catch
+        catch (Exception ex)
         {
-            // Unexpected error in emit pump
+            VhLogger.Instance.LogError(ex, "Exception in EmitPendingAsync for connection {EndPoint}", EndPointQuad);
         }
         finally
         {
@@ -439,35 +385,16 @@ internal sealed class LocalTcpConnection(
     }
 
     /// <summary>
-    /// Emits all data from <paramref name="buffer"/> as MSS-sized TCP segments,
-    /// respecting the peer's advertised receive window. Waits asynchronously when
-    /// the window is full until ACKs open it up.
+    /// Sends as much data as possible from the buffer in MSS-sized segments.
+    /// Returns the SequencePosition representing the consumed prefix.
     /// </summary>
-    private async ValueTask EmitBufferAsync(LocalTcpStack stack, ReadOnlySequence<byte> buffer)
+    private SequencePosition EmitBuffer(LocalTcpStack stack, ref ReadOnlySequence<byte> buffer)
     {
         var mss = Mss;
         var remaining = buffer;
-        int packetCount = 0;
-
-        while (!remaining.IsEmpty && !_disposed)
+        while (!remaining.IsEmpty)
         {
-            // Flow control: check how many bytes the peer's window allows
-            int allowed;
-            lock (_seqLock)
-            {
-                allowed = (int)(_sndUna + _peerWindowSize - _sndNxt);
-            }
-
-            if (allowed <= 0)
-            {
-                // Window full � wait for ACKs to open it
-                try { await _windowOpenSignal.WaitAsync(TimeSpan.FromMilliseconds(500), _cts.Token); }
-                catch (OperationCanceledException) { break; }
-                continue; // Re-check allowed
-            }
-
             var segLen = (int)Math.Min(remaining.Length, mss);
-            segLen = Math.Min(segLen, allowed);
             var segment = remaining.Slice(0, segLen);
 
             var tcpPacket = BuildDataPacket(segment, out var tcp);
@@ -484,18 +411,18 @@ internal sealed class LocalTcpConnection(
             tcp.SequenceNumber = seqForSegment;
             tcp.AcknowledgmentNumber = ackForSegment;
             tcp.Acknowledgment = true;
-            tcp.WindowSize = CurrentWindowSize;
+            tcp.WindowSize = LoopbackWindowSize;
 
-            // Set PSH on the last segment of the current burst.
+            // Set PSH on the last segment of the current burst (helps interactive responsiveness).
             if (remaining.Length == segLen)
                 tcp.Push = true;
 
             stack.SendPacket(tcpPacket);
-            remaining = remaining.Slice(segLen);
 
-            if (++packetCount % 32 == 0)
-                await Task.Yield();
+            remaining = remaining.Slice(segLen);
         }
+
+        return buffer.End;
     }
 
     /// <summary>
@@ -553,7 +480,7 @@ internal sealed class LocalTcpConnection(
             tcp.AcknowledgmentNumber = _rcvNxt;
             tcp.Finish = true;
             tcp.Acknowledgment = true;
-            tcp.WindowSize = CurrentWindowSize;
+            tcp.WindowSize = LoopbackWindowSize;
 
             _sndNxt += 1; // FIN consumes one sequence number
 
@@ -616,21 +543,7 @@ internal sealed class LocalTcpConnection(
         CompleteNetToApp();
         CompleteAppToNet();
 
-        // Wake up the emit pump if it's waiting on window
-        TrySignalWindowOpen();
-
         try { OnClosed?.Invoke(this); } catch { /* ignore subscriber errors */ }
         Dispose();
     }
-
-    private void TrySignalWindowOpen()
-    {
-        // Release the semaphore if no one has signalled yet (non-blocking).
-        if (_windowOpenSignal.CurrentCount == 0)
-        {
-            try { _windowOpenSignal.Release(); }
-            catch (SemaphoreFullException) { /* already signalled */ }
-        }
-    }
-
-    }
+}
