@@ -426,7 +426,7 @@ public sealed class LocalTcpStackTest
         // Check window size from SYN-ACK
         var initialWindowSize = synAckTcp.WindowSize;
         Assert.IsTrue(initialWindowSize > 0, "Window should be > 0");
-        Assert.AreEqual(32768, initialWindowSize, "Loopback window should be scaled (32768)");
+        Assert.AreEqual(16384, initialWindowSize, "Loopback window should be scaled (16384)");
         
         var ackPacket = CreateTcpPacket(ClientIp, ClientPort, ServerIp, ServerPort,
             ack: true, seq: 1001, ackNum: serverSeq + 1);

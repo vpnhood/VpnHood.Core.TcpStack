@@ -8,40 +8,40 @@ namespace VpnHood.Core.TcpStack.LwIP;
 /// </summary>
 public sealed class LwipTcpListener : ITcpListener
 {
-    private readonly Channel<LwipTcpStream> _acceptQueue;
+    private readonly Channel<LwipTcpClient> _acceptQueue;
     private readonly LwipTcpStack _stack;
     private int _stopped;
 
-    internal LwipTcpListener(LwipTcpStack stack, Channel<LwipTcpStream> acceptQueue)
+    internal LwipTcpListener(LwipTcpStack stack, Channel<LwipTcpClient> acceptQueue)
     {
         _stack = stack;
         _acceptQueue = acceptQueue;
     }
 
-    internal bool TryEnqueueAccept(LwipTcpStream stream)
+    internal bool TryEnqueueAccept(LwipTcpClient client)
     {
         if (Volatile.Read(ref _stopped) != 0) return false;
-        return _acceptQueue.Writer.TryWrite(stream);
+        return _acceptQueue.Writer.TryWrite(client);
     }
 
     /// <summary>
     /// Asynchronously accepts all incoming connections.
     /// </summary>
-    public IAsyncEnumerable<LwipTcpStream> AcceptAllAsync(CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<LwipTcpClient> AcceptAllAsync(CancellationToken cancellationToken = default)
     {
         return _acceptQueue.Reader.ReadAllAsync(cancellationToken);
     }
 
     async IAsyncEnumerable<ITcpClient> ITcpListener.AcceptAllAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await foreach (var stream in AcceptAllAsync(cancellationToken).ConfigureAwait(false))
-            yield return stream;
+        await foreach (var client in AcceptAllAsync(cancellationToken).ConfigureAwait(false))
+            yield return client;
     }
 
     /// <summary>
     /// Asynchronously accepts a single incoming connection.
     /// </summary>
-    public ValueTask<LwipTcpStream> AcceptAsync(CancellationToken cancellationToken = default)
+    public ValueTask<LwipTcpClient> AcceptAsync(CancellationToken cancellationToken = default)
     {
         return _acceptQueue.Reader.ReadAsync(cancellationToken);
     }
@@ -59,8 +59,8 @@ public sealed class LwipTcpListener : ITcpListener
         if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
         _stack.StopListening();
         _acceptQueue.Writer.TryComplete();
-        while (_acceptQueue.Reader.TryRead(out var stream))
-            stream.Dispose();
+        while (_acceptQueue.Reader.TryRead(out var client))
+            client.Dispose();
     }
 
     /// <inheritdoc />

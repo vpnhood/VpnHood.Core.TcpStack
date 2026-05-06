@@ -1,26 +1,18 @@
 using System.Buffers;
-using System.Net;
-using VpnHood.Core.TcpStack.Abstractions;
 
 namespace VpnHood.Core.TcpStack.LwIP;
 
 /// <summary>
 /// A standard .NET Stream implementation for TCP connections through the lwIP stack.
 /// </summary>
-public sealed class LwipTcpStream : Stream, ITcpClient
+public sealed class LwipTcpStream : Stream
 {
     private readonly LwipTcpConnection _connection;
     private int _disposed;
 
-    public IPEndPoint LocalEndPoint { get; }
-    public IPEndPoint RemoteEndPoint { get; }
-    Stream ITcpClient.Stream => this;
-
-    internal LwipTcpStream(LwipTcpConnection connection, IPEndPoint localEp, IPEndPoint remoteEp)
+    internal LwipTcpStream(LwipTcpConnection connection)
     {
         _connection = connection;
-        LocalEndPoint = localEp;
-        RemoteEndPoint = remoteEp;
     }
 
     private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
@@ -50,7 +42,7 @@ public sealed class LwipTcpStream : Stream, ITcpClient
     {
         ObjectDisposedException.ThrowIf(IsDisposed, this);
 
-        var reader = _connection.RecvReader;
+        var reader = _connection.ReceiveReader;
         var result = await reader.ReadAsync(cancellationToken);
 
         if (result.IsCanceled || result is { IsCompleted: true, Buffer.IsEmpty: true })

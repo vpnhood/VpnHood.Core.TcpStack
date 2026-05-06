@@ -17,7 +17,7 @@ public sealed class LwipTcpStack : ITcpStack
 {
     private readonly nint _stack;
     private readonly ConcurrentDictionary<nint, LwipTcpConnection> _connections = new();
-    private readonly Channel<LwipTcpStream> _acceptQueue = Channel.CreateUnbounded<LwipTcpStream>(
+    private readonly Channel<LwipTcpClient> _acceptQueue = Channel.CreateUnbounded<LwipTcpClient>(
         new UnboundedChannelOptions { SingleReader = false });
     private readonly Lock _listenerLock = new();
     private readonly Timer _pollTimer;
@@ -94,7 +94,7 @@ public sealed class LwipTcpStack : ITcpStack
     /// <summary>
     /// Asynchronously accepts incoming TCP connections.
     /// </summary>
-    public IAsyncEnumerable<LwipTcpStream> AcceptAllAsync(CancellationToken cancellationToken = default)
+    public IAsyncEnumerable<LwipTcpClient> AcceptAllAsync(CancellationToken cancellationToken = default)
     {
         return ListenAny().AcceptAllAsync(cancellationToken);
     }
@@ -102,7 +102,7 @@ public sealed class LwipTcpStack : ITcpStack
     /// <summary>
     /// Accepts a single incoming connection.
     /// </summary>
-    public ValueTask<LwipTcpStream> AcceptAsync(CancellationToken cancellationToken = default)
+    public ValueTask<LwipTcpClient> AcceptAsync(CancellationToken cancellationToken = default)
     {
         return ListenAny().AcceptAsync(cancellationToken);
     }
@@ -191,8 +191,8 @@ public sealed class LwipTcpStack : ITcpStack
 
         // Ensure accept queue is completed even if no listener was created
         _acceptQueue.Writer.TryComplete();
-        while (_acceptQueue.Reader.TryRead(out var stream))
-            stream.Dispose();
+        while (_acceptQueue.Reader.TryRead(out var client))
+            client.Dispose();
 
         // Dispose all active connections
         foreach (var kvp in _connections) {
@@ -259,8 +259,9 @@ public sealed class LwipTcpStack : ITcpStack
         var connection = new LwipTcpConnection(conn, this, localEp, remoteEp);
         _connections[conn] = connection;
 
-        var stream = new LwipTcpStream(connection, localEp, remoteEp);
-        _acceptQueue.Writer.TryWrite(stream);
+        var stream = new LwipTcpStream(connection);
+        var client = new LwipTcpClient(stream, localEp, remoteEp);
+        _acceptQueue.Writer.TryWrite(client);
         // Return connection handle as the "user context" for recv/closed callbacks
         var gcHandle = GCHandle.Alloc(connection);
         return GCHandle.ToIntPtr(gcHandle);

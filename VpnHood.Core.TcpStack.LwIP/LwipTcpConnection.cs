@@ -22,7 +22,7 @@ internal sealed class LwipTcpConnection : IDisposable
 
     public IPEndPoint LocalEndPoint { get; }
     public IPEndPoint RemoteEndPoint { get; }
-    public PipeReader RecvReader => _receivePipe.Reader;
+    public PipeReader ReceiveReader => _receivePipe.Reader;
 
     internal LwipTcpConnection(nint conn, LwipTcpStack stack, IPEndPoint localEp, IPEndPoint remoteEp)
     {
@@ -33,7 +33,7 @@ internal sealed class LwipTcpConnection : IDisposable
     }
 
     /// <summary>
-    /// Called from the native recv callback. Writes received data into the pipe.
+    /// Called from the native receive callback. Writes received data into the pipe.
     /// Returns the number of bytes consumed (acknowledged to lwIP).
     /// </summary>
     internal int OnDataReceived(ReadOnlySpan<byte> data)
@@ -78,8 +78,8 @@ internal sealed class LwipTcpConnection : IDisposable
 
         var remaining = data;
         while (remaining.Length > 0 && !_disposed && !_remoteClosed) {
-            var sndbuf = _stack.GetSendBufferSpace(_conn);
-            if (sndbuf <= 0) {
+            var sendBufferSpace = _stack.GetSendBufferSpace(_conn);
+            if (sendBufferSpace <= 0) {
                 // Wait for send buffer to become available
                 DrainSendBufferSignal();
                 try { await _sendBufferSignal.WaitAsync(ct); }
@@ -87,7 +87,7 @@ internal sealed class LwipTcpConnection : IDisposable
                 continue;
             }
 
-            var toWrite = Math.Min(remaining.Length, sndbuf);
+            var toWrite = Math.Min(remaining.Length, sendBufferSpace);
             var written = _stack.Write(_conn, remaining.Span[..toWrite]);
             if (written <= 0) {
                 // Wait and retry

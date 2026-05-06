@@ -121,9 +121,9 @@ public sealed class LwipIntegrationTest
                         var buffer = new byte[8192];
                         while (true)
                         {
-                            var n = await stream.ReadAsync(buffer);
+                            var n = await stream.Stream.ReadAsync(buffer);
                             if (n == 0) break;
-                            await stream.WriteAsync(buffer.AsMemory(0, n));
+                            await stream.Stream.WriteAsync(buffer.AsMemory(0, n));
                         }
                     }
                     catch (Exception ex)

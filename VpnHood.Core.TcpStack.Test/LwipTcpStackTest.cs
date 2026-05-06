@@ -87,12 +87,14 @@ public sealed class LwipTcpStackTest
         // Wire stacks together
         lwipStack.OnPacketSend = packet =>
         {
+            // ReSharper disable once AccessToDisposedClosure
             clientStack.ProcessIncoming(packet.Buffer.Span);
             packet.Dispose();
         };
 
         clientStack.OnPacketSend = packet =>
         {
+            // ReSharper disable once AccessToDisposedClosure
             lwipStack.ProcessIncoming(packet.Buffer.Span);
             packet.Dispose();
         };
@@ -107,9 +109,9 @@ public sealed class LwipTcpStackTest
                 var buffer = new byte[4096];
                 while (true)
                 {
-                    var bytesRead = await stream.ReadAsync(buffer);
+                    var bytesRead = await stream.Stream.ReadAsync(buffer);
                     if (bytesRead == 0) break;
-                    await stream.WriteAsync(buffer.AsMemory(0, bytesRead));
+                    await stream.Stream.WriteAsync(buffer.AsMemory(0, bytesRead));
                 }
                 await stream.DisposeAsync();
                 break;
@@ -117,7 +119,7 @@ public sealed class LwipTcpStackTest
         });
 
         // Client side: use LocalTcpStack listener to accept the "outgoing" connection
-        // Actually, we need to drive this differently. We send raw SYN to lwIP and 
+        // Actually, we need to drive this differently. We send raw SYN to lwIP and
         // then the client stack receives packets from lwIP's response.
         // The client stack itself needs a listener to handle the SYN-ACK.
         
@@ -244,7 +246,7 @@ public sealed class LwipTcpStackTest
                 var buffer = new byte[4096];
                 while (true)
                 {
-                    var bytesRead = await stream.ReadAsync(buffer);
+                    var bytesRead = await stream.Stream.ReadAsync(buffer);
                     if (bytesRead == 0) break;
                     lock (serverReceivedData)
                         serverReceivedData.AddRange(buffer.AsSpan(0, bytesRead).ToArray());
@@ -381,9 +383,9 @@ public sealed class LwipTcpStackTest
                 var buffer = new byte[8192];
                 while (true)
                 {
-                    var bytesRead = await stream.ReadAsync(buffer);
+                    var bytesRead = await stream.Stream.ReadAsync(buffer);
                     if (bytesRead == 0) break;
-                    await stream.WriteAsync(buffer.AsMemory(0, bytesRead));
+                    await stream.Stream.WriteAsync(buffer.AsMemory(0, bytesRead));
                 }
                 await stream.DisposeAsync();
                 break;
