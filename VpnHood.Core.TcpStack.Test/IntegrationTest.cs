@@ -13,7 +13,7 @@ public sealed class TcpStackIntegrationTest
 {
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
-    private const int TestDataSize = 256 * 1024;  // 256 KB
+    private const int TestDataSize = 200 * 1024 * 1024;  // 200 MB
 
     /// <summary>
     /// Diagnostic test with minimal data to understand WinDivert integration issues
@@ -232,7 +232,7 @@ public sealed class TcpStackIntegrationTest
     }
 
     [TestMethod]
-    [Timeout(90000)] // 90 seconds timeout
+    [Timeout(180000)] // 3 minutes for 200 MB
     public async Task TestTcpStackWithWinDivertAdapter_Echo_ShouldSucceed()
     {
         // Arrange
@@ -321,15 +321,20 @@ public sealed class TcpStackIntegrationTest
 
             await using var stream = tcpClient.GetStream();
             
-            // Send data in chunks and receive echo
-            const int chunkSize = 8192;
-            var sendTask = SendDataInChunks(stream, testData, chunkSize);
+            // Buffer-all-then-echo: start receive first, send everything, half-close, then await echo.
+            const int chunkSize = 65536;
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(150));
+
+            // Start the reception loop before sending so it is ready when the server echoes data back.
             var receiveTask = ReceiveDataInChunks(stream, receivedData, TestDataSize);
 
-            // Wait for both send and receive to complete with timeout
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-            await Task.WhenAll(sendTask, receiveTask).WaitAsync(cts.Token);
-            
+            // Send all data, then half-close the send side so the echo server sees EOF and starts echoing.
+            await SendDataInChunks(stream, testData, chunkSize).WaitAsync(cts.Token);
+            tcpClient.Client.Shutdown(SocketShutdown.Send);
+
+            // Wait for all echoed data to arrive.
+            await receiveTask.WaitAsync(cts.Token);
+
             // Signal completion
             completionSource.SetResult(true);
 
@@ -370,39 +375,42 @@ public sealed class TcpStackIntegrationTest
             {
                 Console.WriteLine("[ECHO SERVER] Starting...");
                 Console.WriteLine($"[ECHO SERVER] Listening on {listener.LocalEndPoint}");
-                
+
                 await foreach (var stream in listener.AcceptAllAsync())
                 {
                     Console.WriteLine("[ECHO SERVER] ✅ New connection accepted!");
-                    
+
                     // Handle connection in background
                     _ = Task.Run(async () =>
                     {
                         try
                         {
-                            Console.WriteLine("[ECHO SERVER] Connection handler started");
-                            var buffer = new byte[8192];
-                            var totalEchoed = 0;
-                            
+                            Console.WriteLine("[ECHO SERVER] Connection handler started - buffering all data before echoing");
+                            var buffer = new byte[65536];
+                            using var ms = new MemoryStream();
+                            var lastLoggedMb = 0L;
+
+                            // Buffer ALL incoming data until the client half-closes (EOF).
                             while (true)
                             {
-                                Console.WriteLine("[ECHO SERVER] Calling ReadAsync...");
                                 var bytesRead = await stream.Stream.ReadAsync(buffer, 0, buffer.Length);
-                                Console.WriteLine($"[ECHO SERVER] ReadAsync returned {bytesRead} bytes");
                                 if (bytesRead == 0) break;
+                                ms.Write(buffer, 0, bytesRead);
 
-                                // Echo the data back
-                                Console.WriteLine($"[ECHO SERVER] Echoing {bytesRead} bytes back...");
-                                await stream.Stream.WriteAsync(buffer, 0, bytesRead);
-                                totalEchoed += bytesRead;
-                                
-                                if (totalEchoed % 10240 == 0) // Log every 10KB
-                                {
-                                    Console.WriteLine($"[ECHO SERVER] Echoed {totalEchoed:N0} bytes so far...");
+                                var currentLogMb = ms.Length / (10 * 1024 * 1024);
+                                if (currentLogMb > lastLoggedMb) {
+                                    lastLoggedMb = currentLogMb;
+                                    Console.WriteLine($"[ECHO SERVER] Buffered {ms.Length / (1024 * 1024):N0} MB so far...");
                                 }
                             }
-                            
-                            Console.WriteLine($"[ECHO SERVER] Connection finished. Total echoed: {totalEchoed:N0} bytes");
+
+                            Console.WriteLine($"[ECHO SERVER] Received all {ms.Length:N0} bytes. Sending echo...");
+
+                            // Echo all buffered data back in one shot.
+                            ms.Position = 0;
+                            await ms.CopyToAsync(stream.Stream);
+
+                            Console.WriteLine($"[ECHO SERVER] Echo complete. Total echoed: {ms.Length:N0} bytes");
                             await stream.DisposeAsync();
                         }
                         catch (Exception ex)
@@ -411,7 +419,7 @@ public sealed class TcpStackIntegrationTest
                             Console.WriteLine($"[ECHO SERVER] Stack trace: {ex.StackTrace}");
                         }
                     });
-                    
+
                     // Break after handling first connection for this test
                     break;
                 }

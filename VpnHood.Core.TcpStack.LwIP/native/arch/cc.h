@@ -1,5 +1,5 @@
 /*
- * arch/cc.h - Architecture/compiler definitions for MinGW-w64 (GCC on Windows)
+ * arch/cc.h - Architecture/compiler definitions for GCC/Clang (Windows, Linux, Android).
  * Used by lwIP in NO_SYS mode for the VpnHood TCP stack shim.
  */
 #ifndef LWIP_ARCH_CC_H
@@ -8,7 +8,7 @@
 /* Use standard C library errno */
 #include <errno.h>
 
-/* Use GCC's built-in byte order detection */
+/* Byte order: all supported targets (x86, x64, arm, arm64) are little-endian */
 #ifndef BYTE_ORDER
 #define BYTE_ORDER LITTLE_ENDIAN
 #endif

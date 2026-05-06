@@ -16,11 +16,55 @@
 		<ProjectReference Include="..\VpnHood.Core.TcpStack.Abstractions\VpnHood.Core.TcpStack.Abstractions.csproj" />
 	</ItemGroup>
 
-	<!-- Include native DLL as content so it gets copied to output -->
+	<!-- Windows native DLL -->
 	<ItemGroup>
 		<None Include="runtimes\win-x64\native\liblwip_shim.dll" Pack="true" PackagePath="runtimes/win-x64/native/">
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 			<Link>liblwip_shim.dll</Link>
 		</None>
+	</ItemGroup>
+
+	<!-- Android native .so files (RID layout for NuGet packaging) -->
+	<ItemGroup>
+		<None Include="runtimes\android-arm64\native\liblwip_shim.so" Condition="Exists('runtimes\android-arm64\native\liblwip_shim.so')"
+		      Pack="true" PackagePath="runtimes/android-arm64/native/">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+		<None Include="runtimes\android-arm\native\liblwip_shim.so" Condition="Exists('runtimes\android-arm\native\liblwip_shim.so')"
+		      Pack="true" PackagePath="runtimes/android-arm/native/">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+		<None Include="runtimes\android-x64\native\liblwip_shim.so" Condition="Exists('runtimes\android-x64\native\liblwip_shim.so')"
+		      Pack="true" PackagePath="runtimes/android-x64/native/">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+		<None Include="runtimes\android-x86\native\liblwip_shim.so" Condition="Exists('runtimes\android-x86\native\liblwip_shim.so')"
+		      Pack="true" PackagePath="runtimes/android-x86/native/">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</None>
+	</ItemGroup>
+
+	<!--
+	    For Android app projects that reference this library directly (not via NuGet),
+	    add AndroidNativeLibrary items so the .so files are packaged into the APK.
+	    These items are only active when the consuming project targets Android.
+	-->
+	<ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'android' OR '$(AndroidApplication)' == 'true'">
+		<AndroidNativeLibrary Include="runtimes\android-arm64\native\liblwip_shim.so"
+		                      Condition="Exists('runtimes\android-arm64\native\liblwip_shim.so')">
+			<Abi>arm64-v8a</Abi>
+		</AndroidNativeLibrary>
+		<AndroidNativeLibrary Include="runtimes\android-arm\native\liblwip_shim.so"
+		                      Condition="Exists('runtimes\android-arm\native\liblwip_shim.so')">
+			<Abi>armeabi-v7a</Abi>
+		</AndroidNativeLibrary>
+		<AndroidNativeLibrary Include="runtimes\android-x64\native\liblwip_shim.so"
+		                      Condition="Exists('runtimes\android-x64\native\liblwip_shim.so')">
+			<Abi>x86_64</Abi>
+		</AndroidNativeLibrary>
+		<AndroidNativeLibrary Include="runtimes\android-x86\native\liblwip_shim.so"
+		                      Condition="Exists('runtimes\android-x86\native\liblwip_shim.so')">
+			<Abi>x86</Abi>
+		</AndroidNativeLibrary>
 	</ItemGroup>
 </Project>

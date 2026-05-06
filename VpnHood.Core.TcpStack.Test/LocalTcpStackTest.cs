@@ -446,16 +446,14 @@ public sealed class LocalTcpStackTest
         
         await Task.Delay(50, cts.Token);
 
-        // Get window size from ACK - should be same (fixed for loopback)
+        // Get window size from ACK - should remain fixed (loopback uses constant window)
         IpPacket ackResponse;
         lock (lockObj) { ackResponse = sentPackets.First(p => p.ExtractTcp().Acknowledgment); }
         var windowAfterData = ackResponse.ExtractTcp().WindowSize;
         
-        // Window should reflect free pipe space (PipeBufferSize - unread) >> windowScale.
-        // After receiving 1000 bytes (unread), window will be slightly less than initial.
-        Assert.IsTrue(windowAfterData < initialWindowSize,
-            $"Window should shrink after receiving data; before={initialWindowSize}, after={windowAfterData}");
-        Assert.IsTrue(windowAfterData > 0, "Window should still be positive");
+        // Window should remain the same (fixed for loopback - pipe handles backpressure).
+        Assert.AreEqual(initialWindowSize, windowAfterData,
+            "Window should remain fixed for loopback");
 
         await stream.DisposeAsync();
     }

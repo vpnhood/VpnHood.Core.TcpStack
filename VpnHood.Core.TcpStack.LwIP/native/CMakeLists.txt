@@ -4,6 +4,35 @@ project(lwip_shim C)
 # Path to the lwIP source tree
 set(LWIP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../_Test/lwip" CACHE PATH "Path to lwIP source")
 
+# Determine output RID based on the target platform/ABI
+if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(RUNTIME_RID "android-arm64")
+    elseif(ANDROID_ABI STREQUAL "armeabi-v7a")
+        set(RUNTIME_RID "android-arm")
+    elseif(ANDROID_ABI STREQUAL "x86_64")
+        set(RUNTIME_RID "android-x64")
+    elseif(ANDROID_ABI STREQUAL "x86")
+        set(RUNTIME_RID "android-x86")
+    else()
+        message(FATAL_ERROR "Unsupported Android ABI: ${ANDROID_ABI}")
+    endif()
+elseif(WIN32)
+    set(RUNTIME_RID "win-x64")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        set(RUNTIME_RID "linux-arm64")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
+        set(RUNTIME_RID "linux-arm")
+    else()
+        set(RUNTIME_RID "linux-x64")
+    endif()
+else()
+    message(FATAL_ERROR "Unsupported platform: ${CMAKE_SYSTEM_NAME}")
+endif()
+
+message(STATUS "Target RID: ${RUNTIME_RID}")
+
 # Resolve to absolute
 get_filename_component(LWIP_DIR "${LWIP_DIR}" ABSOLUTE)
 
@@ -70,24 +99,31 @@ target_compile_definitions(lwip_shim PRIVATE
     LWIP_DEBUG=0
 )
 
-# Windows-specific settings
+# Platform-specific settings
 if(WIN32)
     target_compile_definitions(lwip_shim PRIVATE _CRT_SECURE_NO_WARNINGS)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    # Hide all symbols by default; only exported ones are visible
+    target_compile_options(lwip_shim PRIVATE -fvisibility=hidden)
+    # Android doesn't need a lib prefix for dlopen but CMake adds it automatically
 endif()
 
-# Output to a predictable location
+# Output to a predictable RID-based location
 set_target_properties(lwip_shim PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../runtimes/win-x64/native"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../runtimes/win-x64/native"
-    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../runtimes/win-x64/native"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../runtimes/${RUNTIME_RID}/native"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../runtimes/${RUNTIME_RID}/native"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../runtimes/${RUNTIME_RID}/native"
     OUTPUT_NAME "lwip_shim"
 )
 
-# Ensure release builds strip debug info
+# Release build optimizations
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     if(MSVC)
         target_compile_options(lwip_shim PRIVATE /O2 /DNDEBUG)
     else()
-        target_compile_options(lwip_shim PRIVATE -O2 -DNDEBUG)
+        target_compile_options(lwip_shim PRIVATE -O2 -DNDEBUG -ffunction-sections -fdata-sections)
+        if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
+            target_link_options(lwip_shim PRIVATE -Wl,--gc-sections)
+        endif()
     endif()
 endif()

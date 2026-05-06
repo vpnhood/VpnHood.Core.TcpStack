@@ -49,8 +49,12 @@ bld/
 # VSCode settings
 .vscode/
 
-# CMake build output
-**/native/build/
+# CMake build output (all build_* dirs under native/, e.g. build_arm64-v8a, build_x86_64, build/)
+**/native/build*/
+
+# Native binary outputs - keep compiled binaries so consumers don't need to build them
+!**/runtimes/**/native/*.dll
+!**/runtimes/**/native/*.so
 # Uncomment if you have tasks that create the project's static files in wwwroot
 #wwwroot/
 
