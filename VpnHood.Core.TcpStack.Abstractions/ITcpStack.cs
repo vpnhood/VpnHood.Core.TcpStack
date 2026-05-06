@@ -38,4 +38,9 @@ public interface ITcpStack : IDisposable
     /// Creates a listener that accepts incoming TCP connections on the specified local endpoint.
     /// </summary>
     ITcpListener Listen(IPEndPoint localEndPoint);
+
+    /// <summary>
+    /// Aborts all active TCP connections immediately.
+    /// </summary>
+    void DropAllConnections();
 }

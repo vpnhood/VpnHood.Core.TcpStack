@@ -82,6 +82,15 @@ public sealed class LwipTcpStack : ITcpStack
 
     ITcpListener ITcpStack.ListenAny() => ListenAny();
 
+    /// <summary>
+    /// Aborts all active TCP connections immediately.
+    /// </summary>
+    public void DropAllConnections()
+    {
+        foreach (var kvp in _connections)
+            AbortConnection(kvp.Key);
+    }
+
     internal void StopListening()
     {
         lock (_listenerLock) {
