@@ -9,7 +9,7 @@ namespace VpnHood.Core.TcpStack.LwIP;
 /// </summary>
 internal sealed class LwipTcpConnection : IDisposable
 {
-    private readonly Pipe _recvPipe = new(new PipeOptions(
+    private readonly Pipe _receivePipe = new(new PipeOptions(
         pauseWriterThreshold: 256 * 1024,
         resumeWriterThreshold: 128 * 1024,
         useSynchronizationContext: false));
@@ -22,7 +22,7 @@ internal sealed class LwipTcpConnection : IDisposable
 
     public IPEndPoint LocalEndPoint { get; }
     public IPEndPoint RemoteEndPoint { get; }
-    public PipeReader RecvReader => _recvPipe.Reader;
+    public PipeReader RecvReader => _receivePipe.Reader;
 
     internal LwipTcpConnection(nint conn, LwipTcpStack stack, IPEndPoint localEp, IPEndPoint remoteEp)
     {
@@ -40,7 +40,7 @@ internal sealed class LwipTcpConnection : IDisposable
     {
         if (_disposed || _remoteClosed) return data.Length;
 
-        var writer = _recvPipe.Writer;
+        var writer = _receivePipe.Writer;
         var span = writer.GetSpan(data.Length);
         data.CopyTo(span);
         writer.Advance(data.Length);
@@ -57,7 +57,7 @@ internal sealed class LwipTcpConnection : IDisposable
     internal void OnRemoteClosed(int err)
     {
         _remoteClosed = true;
-        try { _recvPipe.Writer.Complete(); } catch { /* already completed */ }
+        try { _receivePipe.Writer.Complete(); } catch { /* already completed */ }
         TrySignalSendBuffer();
     }
 
@@ -108,7 +108,7 @@ internal sealed class LwipTcpConnection : IDisposable
     {
         if (_disposed) return;
         _stack.CloseConnection(_conn);
-        try { _recvPipe.Writer.Complete(); } catch { /* already completed */ }
+        try { _receivePipe.Writer.Complete(); } catch { /* already completed */ }
     }
 
     public void Dispose()
@@ -116,7 +116,7 @@ internal sealed class LwipTcpConnection : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        try { _recvPipe.Writer.Complete(); } catch { /* ignore */ }
+        try { _receivePipe.Writer.Complete(); } catch { /* ignore */ }
         TrySignalSendBuffer();
     }
 

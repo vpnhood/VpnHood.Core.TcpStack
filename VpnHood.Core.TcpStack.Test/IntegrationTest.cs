@@ -112,9 +112,9 @@ public sealed class TcpStackIntegrationTest
                     while (true)
                     {
                         Console.WriteLine("[SERVER] Waiting for data...");
-                        var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                        var bytesRead = await stream.Stream.ReadAsync(buffer, 0, buffer.Length);
                         Console.WriteLine($"[SERVER] Read {bytesRead} bytes");
-                        
+
                         if (bytesRead == 0)
                         {
                             Console.WriteLine("[SERVER] Connection closed by client");
@@ -123,12 +123,12 @@ public sealed class TcpStackIntegrationTest
 
                         lock (serverReceivedData)
                             serverReceivedData.AddRange(buffer.Take(bytesRead));
-                        
+
                         var dataHex = BitConverter.ToString(buffer.Take(Math.Min(32, bytesRead)).ToArray());
                         Console.WriteLine($"[SERVER] Received data (hex): {dataHex}");
-                        
+
                         Console.WriteLine($"[SERVER] Echoing {bytesRead} bytes back...");
-                        await stream.WriteAsync(buffer, 0, bytesRead);
+                        await stream.Stream.WriteAsync(buffer, 0, bytesRead);
                         Console.WriteLine("[SERVER] Echo complete");
                     }
                 }
@@ -387,13 +387,13 @@ public sealed class TcpStackIntegrationTest
                             while (true)
                             {
                                 Console.WriteLine("[ECHO SERVER] Calling ReadAsync...");
-                                var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                                var bytesRead = await stream.Stream.ReadAsync(buffer, 0, buffer.Length);
                                 Console.WriteLine($"[ECHO SERVER] ReadAsync returned {bytesRead} bytes");
                                 if (bytesRead == 0) break;
-                                
+
                                 // Echo the data back
                                 Console.WriteLine($"[ECHO SERVER] Echoing {bytesRead} bytes back...");
-                                await stream.WriteAsync(buffer, 0, bytesRead);
+                                await stream.Stream.WriteAsync(buffer, 0, bytesRead);
                                 totalEchoed += bytesRead;
                                 
                                 if (totalEchoed % 10240 == 0) // Log every 10KB

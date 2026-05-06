@@ -19,7 +19,7 @@ namespace VpnHood.Core.TcpStack;
 /// this automatically when AutoDisposePackets = true). When no consumer is registered, the
 /// stack disposes the packet itself to release pooled memory.
 /// </remarks>
-public sealed class LocalTcpStack : IDisposable, ITcpStack
+public sealed class LocalTcpStack : ITcpStack
 {
     // Fixed window size for loopback - no need for large windows since transfer is instant
     private const ushort LoopbackWindowSize = 16384;

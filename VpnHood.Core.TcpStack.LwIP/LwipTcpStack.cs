@@ -3,7 +3,6 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using VpnHood.Core.Packets;
-using VpnHood.Core.Packets.Extensions;
 using VpnHood.Core.TcpStack.Abstractions;
 using VpnHood.Core.Toolkit.Net;
 
@@ -14,7 +13,7 @@ namespace VpnHood.Core.TcpStack.LwIP;
 /// Provides the same listener/stream pattern as <see cref="LocalTcpStack"/>
 /// but delegates TCP state management to lwIP.
 /// </summary>
-public sealed class LwipTcpStack : IDisposable, ITcpStack
+public sealed class LwipTcpStack : ITcpStack
 {
     private readonly nint _stack;
     private readonly ConcurrentDictionary<nint, LwipTcpConnection> _connections = new();
@@ -49,7 +48,7 @@ public sealed class LwipTcpStack : IDisposable, ITcpStack
         unsafe {
             _outputDelegate = OnNativeOutput;
             _acceptDelegate = OnNativeAccept;
-            _recvDelegate = OnNativeRecv;
+            _recvDelegate = OnNativeReceive;
         }
         _closedDelegate = OnNativeClosed;
         _sentDelegate = OnNativeSent;
@@ -267,7 +266,7 @@ public sealed class LwipTcpStack : IDisposable, ITcpStack
         return GCHandle.ToIntPtr(gcHandle);
     }
 
-    private unsafe int OnNativeRecv(nint conn, byte* data, int len, nint connCtx)
+    private static unsafe int OnNativeReceive(nint conn, byte* data, int len, nint connCtx)
     {
         if (connCtx == 0) return len; // acknowledge but discard
 
@@ -292,7 +291,7 @@ public sealed class LwipTcpStack : IDisposable, ITcpStack
         gcHandle.Free();
     }
 
-    private void OnNativeSent(nint conn, int len, nint connCtx)
+    private static void OnNativeSent(nint conn, int len, nint connCtx)
     {
         if (connCtx == 0) return;
 

@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+// ReSharper disable StringLiteralTypo
+// ReSharper disable IdentifierTypo
 
 namespace VpnHood.Core.TcpStack.LwIP;
 

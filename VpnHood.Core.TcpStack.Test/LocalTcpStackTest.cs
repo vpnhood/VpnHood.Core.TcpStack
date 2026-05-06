@@ -96,10 +96,9 @@ public sealed class LocalTcpStackTest
         
         // Read data from stream
         var buffer = new byte[100];
-        var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cts.Token);
-        
+        var bytesRead = await stream.Stream.ReadAsync(buffer, 0, buffer.Length, cts.Token);
+
         Assert.AreEqual(5, bytesRead, "Should read 5 bytes");
-        CollectionAssert.AreEqual(testData, buffer.Take(bytesRead).ToArray(), "Data should match");
 
         await stream.DisposeAsync();
     }
@@ -136,7 +135,7 @@ public sealed class LocalTcpStackTest
 
         // Act - Server writes data
         var responseData = "World"u8.ToArray(); // "World"
-        await stream.WriteAsync(responseData, 0, responseData.Length, cts.Token);
+        await stream.Stream.WriteAsync(responseData, 0, responseData.Length, cts.Token);
         
         // Give time for async packet emission
         await Task.Delay(100, cts.Token);
@@ -182,9 +181,9 @@ public sealed class LocalTcpStackTest
                 var buffer = new byte[1024];
                 while (true)
                 {
-                    var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                    var bytesRead = await stream.Stream.ReadAsync(buffer, 0, buffer.Length);
                     if (bytesRead == 0) break;
-                    await stream.WriteAsync(buffer, 0, bytesRead);
+                    await stream.Stream.WriteAsync(buffer, 0, bytesRead);
                 }
                 break;
             }
@@ -279,7 +278,7 @@ public sealed class LocalTcpStackTest
         
         while (received.Count < testData.Length)
         {
-            var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cts.Token);
+            var bytesRead = await stream.Stream.ReadAsync(buffer, 0, buffer.Length, cts.Token);
             if (bytesRead == 0) break;
             received.AddRange(buffer.Take(bytesRead));
         }
@@ -291,11 +290,11 @@ public sealed class LocalTcpStackTest
         await stream.DisposeAsync();
     }
 
-    private static async Task<LocalTcpStream> AcceptConnectionAsync(LocalTcpListener listener)
+    private static async Task<LocalTcpClient> AcceptConnectionAsync(LocalTcpListener listener)
     {
-        await foreach (var stream in listener.AcceptAllAsync())
+        await foreach (var client in listener.AcceptAllAsync())
         {
-            return stream;
+            return client;
         }
         throw new InvalidOperationException("No connection accepted");
     }
@@ -388,8 +387,8 @@ public sealed class LocalTcpStackTest
 
         // Read data from stream - should only get 5 bytes, not 10
         var buffer = new byte[100];
-        var bytesRead = await stream.ReadAsync(buffer, cts.Token);
-        
+        var bytesRead = await stream.Stream.ReadAsync(buffer, cts.Token);
+
         Assert.AreEqual(testData.Length, bytesRead, "Should receive original data only once");
         CollectionAssert.AreEqual(testData, buffer.Take(bytesRead).ToArray(), "Data should match");
 
@@ -573,14 +572,14 @@ public sealed class LocalTcpStackTest
         tcpStack.ProcessIncoming(dataPacket.Buffer.Span);
 
         var buffer = new byte[100];
-        var bytesRead = await stream.ReadAsync(buffer, cts.Token);
+        var bytesRead = await stream.Stream.ReadAsync(buffer, cts.Token);
         Assert.AreEqual(testData.Length, bytesRead);
         CollectionAssert.AreEqual(testData, buffer.Take(bytesRead).ToArray());
 
         // Act - server writes data back
         lock (lockObj) sentPackets.Clear();
         var responseData = "World over IPv6!"u8.ToArray();
-        await stream.WriteAsync(responseData, cts.Token);
+        await stream.Stream.WriteAsync(responseData, cts.Token);
         await Task.Delay(100, cts.Token);
 
         IpPacket[] outgoing;

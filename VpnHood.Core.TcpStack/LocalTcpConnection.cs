@@ -44,7 +44,7 @@ internal sealed class LocalTcpConnection(
 
     private readonly Lock _seqLock = new();
     private readonly CancellationTokenSource _cts = new();
-    private LocalTcpStream? _pendingStream;
+    private LocalTcpClient? _pendingClient;
 
     private bool _finSent;
     private bool _finReceived;
@@ -87,8 +87,12 @@ internal sealed class LocalTcpConnection(
     /// </summary>
     public void Start(LocalTcpStack stack)
     {
-        // Pre-create the stream that will be enqueued once handshake completes.
-        _pendingStream = new LocalTcpStream(this, stack);
+        // Pre-create the client (and its stream) that will be enqueued once handshake completes.
+        var stream = new LocalTcpStream(this, stack);
+        _pendingClient = new LocalTcpClient(
+            stream,
+            endPointQuad.Destination.ToIPEndPoint(),
+            endPointQuad.Source.ToIPEndPoint());
 
         // Start idle monitor
         _ = Task.Run(MonitorIdleAsync);
@@ -145,19 +149,19 @@ internal sealed class LocalTcpConnection(
     /// </summary>
     public void MarkEstablished()
     {
-        LocalTcpStream? streamToEnqueue;
+        LocalTcpClient? clientToEnqueue;
         lock (_seqLock)
         {
             if (State != TcpConnectionState.SynReceived) return;
             State = TcpConnectionState.Established;
-            streamToEnqueue = _pendingStream;
-            _pendingStream = null;
+            clientToEnqueue = _pendingClient;
+            _pendingClient = null;
         }
 
-        if (streamToEnqueue != null && !listener.TryEnqueueAccept(streamToEnqueue))
+        if (clientToEnqueue != null && !listener.TryEnqueueAccept(clientToEnqueue))
         {
-            // Listener has been stopped: dispose stream and reset the connection
-            streamToEnqueue.Dispose();
+            // Listener has been stopped: dispose client and reset the connection
+            clientToEnqueue.Dispose();
         }
     }
 
@@ -527,17 +531,16 @@ internal sealed class LocalTcpConnection(
             return;
 
         // Suppress any future FIN emission (RST/idle/double-FIN paths should not send FIN).
-        LocalTcpStream? abandoned;
+        LocalTcpClient? abandoned;
         lock (_seqLock)
         {
             State = TcpConnectionState.Closed;
             _finSent = true;
-            abandoned = _pendingStream;
-            _pendingStream = null;
+            abandoned = _pendingClient;
+            _pendingClient = null;
         }
 
-        // Dispose unaccepted stream if handshake never completed. With _finSent=true above,
-        // the stream's Dispose -> StartFin path is a no-op.
+        // Dispose unaccepted client if handshake never completed.
         abandoned?.Dispose();
 
         CompleteNetToApp();
