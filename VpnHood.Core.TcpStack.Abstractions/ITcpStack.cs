@@ -1,3 +1,4 @@
+using System.Net;
 using VpnHood.Core.Packets;
 
 namespace VpnHood.Core.TcpStack.Abstractions;
@@ -32,4 +33,9 @@ public interface ITcpStack : IDisposable
     /// Creates a listener that accepts incoming TCP connections on any address and port.
     /// </summary>
     ITcpListener ListenAny();
+
+    /// <summary>
+    /// Creates a listener that accepts incoming TCP connections on the specified local endpoint.
+    /// </summary>
+    ITcpListener Listen(IPEndPoint localEndPoint);
 }

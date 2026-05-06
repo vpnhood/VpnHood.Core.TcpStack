@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Cryptography;
 using VpnHood.Core.Packets;
 using VpnHood.Core.Packets.Extensions;
+using VpnHood.Core.TcpStack.Abstractions;
 using VpnHood.Core.Toolkit.Net;
 
 namespace VpnHood.Core.TcpStack.Test;
@@ -61,11 +62,11 @@ public sealed class LocalTcpStackTest
     public async Task DataTransfer_ShouldSucceed()
     {
         // Arrange
-        var tcpStack = new LocalTcpStack();
+        ITcpStack tcpStack = new LocalTcpStack();
         var sentPackets = new List<IpPacket>();
         tcpStack.OnPacketSend = sentPackets.Add;
 
-        var listener = tcpStack.Listen(new IpEndPointValue(ServerIp, ServerPort));
+        var listener = tcpStack.Listen(new IPEndPoint(ServerIp, ServerPort));
         var acceptTask = AcceptConnectionAsync(listener);
 
         // Complete handshake
@@ -290,7 +291,7 @@ public sealed class LocalTcpStackTest
         await stream.DisposeAsync();
     }
 
-    private static async Task<LocalTcpClient> AcceptConnectionAsync(LocalTcpListener listener)
+    private static async Task<ITcpClient> AcceptConnectionAsync(ITcpListener listener)
     {
         await foreach (var client in listener.AcceptAllAsync())
         {

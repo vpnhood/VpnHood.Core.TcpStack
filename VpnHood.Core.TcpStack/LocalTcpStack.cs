@@ -56,6 +56,7 @@ public sealed class LocalTcpStack : ITcpStack
     }
 
     ITcpListener ITcpStack.ListenAny() => ListenAny();
+    ITcpListener ITcpStack.Listen(IPEndPoint localEndPoint) => Listen(localEndPoint.ToValue());
 
     public bool StopListening(IPEndPoint localEndPoint)
     {
@@ -276,7 +277,7 @@ public sealed class LocalTcpStack : ITcpStack
     }
 
     /// <summary>
-    /// Closes all currently active connections. New connections can still be accepted afterwards.
+    /// Closes all currently active connections. New connections can still be accepted afterward.
     /// </summary>
     public void DropAllConnections()
     {

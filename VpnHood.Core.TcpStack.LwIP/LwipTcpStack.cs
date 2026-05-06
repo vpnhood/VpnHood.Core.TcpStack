@@ -78,6 +78,8 @@ public sealed class LwipTcpStack : ITcpStack
         }
     }
 
+    ITcpListener ITcpStack.Listen(IPEndPoint localEndPoint)=> ListenAny();
+
     ITcpListener ITcpStack.ListenAny() => ListenAny();
 
     internal void StopListening()

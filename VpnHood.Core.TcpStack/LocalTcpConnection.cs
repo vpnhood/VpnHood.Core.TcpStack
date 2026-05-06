@@ -58,7 +58,7 @@ internal sealed class LocalTcpConnection(
     private uint _sndNxt = isnLocal; // SYN sequence; bumped to ISN+1 after SYN-ACK is sent.
     private uint _rcvNxt = isnRemote + 1; // We have already "consumed" the peer's SYN.
 
-    public IpEndPointQuad EndPointQuad { get; } = endPointQuad;
+    public IpEndPointQuad EndPointQuad => endPointQuad;
     public uint IsnLocal { get; } = isnLocal;
     public ushort Mss { get; } = ClampMss(peerMss);
     public TcpConnectionState State { get; private set; } = TcpConnectionState.SynReceived;
