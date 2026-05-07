@@ -21,8 +21,8 @@ namespace VpnHood.Core.TcpStack;
 /// </remarks>
 public sealed class LocalTcpStack : ITcpStack
 {
-    // Fixed window size for loopback - no need for large windows since transfer is instant
-    private const ushort LoopbackWindowSize = 16384;
+    // Max TCP window without window scaling.
+    private const ushort LoopbackWindowSize = 0xFFFF;
 
     private readonly ConcurrentDictionary<IpEndPointQuad, LocalTcpConnection> _connections = new();
     private readonly ConcurrentDictionary<IpEndPointValue, LocalTcpListener> _listeners = new();
@@ -186,9 +186,19 @@ public sealed class LocalTcpStack : ITcpStack
 
     private void SendSynAck(LocalTcpConnection conn)
     {
+        // Advertise our MSS (1460) so the peer doesn't fall back to the default 536-byte MSS.
+        // Without this option, the peer will send us 536-byte packets which dramatically
+        // increases packet count (≈2.7x) and slows down the receive path through WinDivert.
+        // Format: kind=2, len=4, value=MSS (16-bit big-endian).
+        const ushort advertisedMss = 1460;
+        ReadOnlySpan<byte> options = [2, 4, (byte)(advertisedMss >> 8), (byte)(advertisedMss & 0xFF)];
+
+        // Intentionally omit Window Scale option from SYN-ACK so window scaling is
+        // disabled for this connection. Peer's WindowSize field will be interpreted
+        // as a raw 16-bit value (max 65535).
         var packet = PacketBuilder.BuildTcp(
             conn.EndPointQuad.Destination, conn.EndPointQuad.Source,
-            options: ReadOnlySpan<byte>.Empty,
+            options: options,
             payload: ReadOnlySpan<byte>.Empty);
 
         var tcp = packet.ExtractTcp();
@@ -214,10 +224,12 @@ public sealed class LocalTcpStack : ITcpStack
         if (tcpPacket.Finish) flags |= TcpFlags.Fin;
         if (tcpPacket.Reset) flags |= TcpFlags.Rst;
         if (tcpPacket.Acknowledgment) flags |= TcpFlags.Ack;
+        if (tcpPacket.Push) flags |= TcpFlags.Psh;
 
         var (handled, needsAck) = conn.TryHandleIncoming(
             tcpPacket.SequenceNumber,
             tcpPacket.AcknowledgmentNumber,
+            tcpPacket.WindowSize,
             flags,
             tcpPacket.Payload.Span);
 

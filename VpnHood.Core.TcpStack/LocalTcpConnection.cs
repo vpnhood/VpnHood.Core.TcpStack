@@ -15,14 +15,14 @@ internal sealed class LocalTcpConnection(
     TimeSpan? tcpTimeout = null)
     : IDisposable
 {
-    // For loopback we use a moderate fixed window size; the pipe handles backpressure internally.
-    private const ushort LoopbackWindowSize = 16384;
+    // Static TCP receive window advertised to the peer (no window scaling).
+    private const ushort LoopbackWindowSize = 0xFFFF;
 
     // Conservative fallback when peer SYN does not advertise an MSS.
     private const ushort DefaultMss = 536;
 
-    // Upper cap so a single TCP segment never exceeds what fits comfortably in a typical MTU.
-    private const ushort MaxMss = LoopbackWindowSize;
+    // Standard Ethernet MSS cap. Peer's advertised MSS is used when smaller.
+    private const ushort MaxMss = 1460;
 
     private readonly TimeSpan _idleTimeout = tcpTimeout ?? TimeSpan.FromMinutes(15);
     private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromMinutes(1);
@@ -38,6 +38,7 @@ internal sealed class LocalTcpConnection(
 
     private readonly Lock _seqLock = new();
     private readonly CancellationTokenSource _cts = new();
+    private readonly SemaphoreSlim _windowSignal = new(0, 1);
     private LocalTcpClient? _pendingClient;
     private LocalTcpStack? _stack;
 
@@ -50,7 +51,10 @@ internal sealed class LocalTcpConnection(
     private bool _netToAppCompleted;
     private bool _appToNetCompleted;
     private uint _sndNxt = isnLocal; // SYN sequence; bumped to ISN+1 after SYN-ACK is sent.
+    private uint _sndUna = isnLocal; // Oldest unacknowledged byte.
+    private uint _peerWindow = LoopbackWindowSize; // Peer's last advertised receive window.
     private uint _rcvNxt = isnRemote + 1; // We have already "consumed" the peer's SYN.
+    private int _unackedSegments; // Count of in-order data segments not yet acknowledged.
 
     public IpEndPointQuad EndPointQuad => endPointQuad;
     public uint IsnLocal { get; } = isnLocal;
@@ -115,6 +119,7 @@ internal sealed class LocalTcpConnection(
         {
             if (_sndNxtAfterSynSet) return;
             _sndNxt = IsnLocal + 1;
+            _sndUna = IsnLocal + 1;
             _sndNxtAfterSynSet = true;
         }
     }
@@ -162,63 +167,83 @@ internal sealed class LocalTcpConnection(
 
     /// <summary>
     /// Writes data from app directly as TCP segments to the network (inline on caller's thread).
-    /// This eliminates cross-thread scheduling latency that was causing slow downloads on Android.
+    /// Respects the peer's advertised receive window.
     /// </summary>
-    public ValueTask SendAppDataAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
+    public async ValueTask SendAppDataAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
     {
-        if (_disposed || _appToNetCompleted) return ValueTask.CompletedTask;
+        if (_disposed || _appToNetCompleted) return;
         Touch();
 
         var stack = _stack;
-        if (stack == null) return ValueTask.CompletedTask;
+        if (stack == null) return;
 
         var mss = Mss;
-        var span = data.Span;
         var offset = 0;
 
-        while (offset < span.Length)
+        while (offset < data.Length)
         {
             ct.ThrowIfCancellationRequested();
+            if (_disposed || _appToNetCompleted) return;
 
-            var segLen = Math.Min(span.Length - offset, mss);
-            var segmentData = span.Slice(offset, segLen);
-
-            var packet = PacketBuilder.BuildTcp(EndPointQuad.Destination, EndPointQuad.Source,
-                options: ReadOnlySpan<byte>.Empty, payload: segmentData);
-            var tcp = packet.ExtractTcp();
-
-            uint seqForSegment;
-            uint ackForSegment;
+            // Determine how much we can send within the peer's window.
+            int allowable;
             lock (_seqLock)
             {
-                seqForSegment = _sndNxt;
-                ackForSegment = _rcvNxt;
-                _sndNxt += (uint)segLen;
+                var inFlight = (long)(_sndNxt - _sndUna);
+                allowable = (int)Math.Max(0, _peerWindow - inFlight);
             }
 
-            tcp.SequenceNumber = seqForSegment;
-            tcp.AcknowledgmentNumber = ackForSegment;
-            tcp.Acknowledgment = true;
-            tcp.WindowSize = LoopbackWindowSize;
+            if (allowable <= 0)
+            {
+                DrainWindowSignal();
+                try { await _windowSignal.WaitAsync(ct); }
+                catch (OperationCanceledException) { return; }
+                continue;
+            }
 
-            // Set PSH on the last segment of the current write.
-            if (offset + segLen >= span.Length)
-                tcp.Push = true;
+            var remaining = data.Length - offset;
+            var burst = Math.Min(remaining, allowable);
 
-            stack.SendPacket(packet);
-            offset += segLen;
+            while (burst > 0)
+            {
+                var segLen = Math.Min(burst, mss);
+                var segmentData = data.Span.Slice(offset, segLen);
+
+                var packet = PacketBuilder.BuildTcp(EndPointQuad.Destination, EndPointQuad.Source,
+                    options: ReadOnlySpan<byte>.Empty, payload: segmentData);
+                var tcp = packet.ExtractTcp();
+
+                uint seqForSegment;
+                uint ackForSegment;
+                lock (_seqLock)
+                {
+                    seqForSegment = _sndNxt;
+                    ackForSegment = _rcvNxt;
+                    _sndNxt += (uint)segLen;
+                }
+
+                tcp.SequenceNumber = seqForSegment;
+                tcp.AcknowledgmentNumber = ackForSegment;
+                tcp.Acknowledgment = true;
+                tcp.WindowSize = LoopbackWindowSize;
+
+                // Set PSH on the last segment of the current write.
+                if (offset + segLen >= data.Length)
+                    tcp.Push = true;
+
+                stack.SendPacket(packet);
+                offset += segLen;
+                burst -= segLen;
+            }
         }
-
-        return ValueTask.CompletedTask;
     }
 
     /// <summary>
     /// Handles incoming TCP data from network.
     /// Returns: (handled, needsAck) - handled indicates if packet was processed, needsAck if ACK should be sent
     /// </summary>
-    public (bool handled, bool needsAck) TryHandleIncoming(uint seq, uint ack, TcpFlags flags, ReadOnlySpan<byte> payload)
+    public (bool handled, bool needsAck) TryHandleIncoming(uint seq, uint ack, ushort windowSize, TcpFlags flags, ReadOnlySpan<byte> payload)
     {
-        _ = ack;
         if (_disposed) return (false, false);
         Touch();
 
@@ -226,6 +251,20 @@ internal sealed class LocalTcpConnection(
         {
             Close();
             return (false, false);
+        }
+
+        // Process ACK: advance _sndUna and update peer's window.
+        if (flags.HasFlag(TcpFlags.Ack))
+        {
+            lock (_seqLock)
+            {
+                // Only advance if ack is within [_sndUna, _sndNxt].
+                var diff = (long)(ack - _sndUna);
+                if (diff > 0 && diff <= (long)(_sndNxt - _sndUna))
+                    _sndUna = ack;
+                _peerWindow = windowSize;
+            }
+            TrySignalWindow();
         }
 
         try
@@ -269,6 +308,21 @@ internal sealed class LocalTcpConnection(
 
                 needsAck = payload.Length > 0;
                 finCloses = false;
+
+                // Delayed ACK: only ACK every 2nd in-order data segment to halve ACK traffic.
+                // FIN/PSH packets bypass the delay and ACK immediately.
+                if (needsAck && !flags.HasFlag(TcpFlags.Fin) && !flags.HasFlag(TcpFlags.Psh))
+                {
+                    _unackedSegments++;
+                    if (_unackedSegments < 2)
+                        needsAck = false;
+                    else
+                        _unackedSegments = 0;
+                }
+                else if (needsAck)
+                {
+                    _unackedSegments = 0;
+                }
 
                 if (flags.HasFlag(TcpFlags.Fin))
                 {
@@ -403,6 +457,20 @@ internal sealed class LocalTcpConnection(
         try { _netToAppPipe.Writer.Complete(); } catch { /* already completed */ }
     }
 
+    private void TrySignalWindow()
+    {
+        if (_windowSignal.CurrentCount == 0)
+        {
+            try { _windowSignal.Release(); }
+            catch (SemaphoreFullException) { /* already signalled */ }
+        }
+    }
+
+    private void DrainWindowSignal()
+    {
+        while (_windowSignal.Wait(0)) { }
+    }
+
     private void Close()
     {
         if (Interlocked.Exchange(ref _closedFlag, 1) != 0)
@@ -422,6 +490,7 @@ internal sealed class LocalTcpConnection(
 
         CompleteNetToApp();
         _appToNetCompleted = true;
+        TrySignalWindow();
 
         try { OnClosed?.Invoke(this); } catch { /* ignore subscriber errors */ }
         Dispose();

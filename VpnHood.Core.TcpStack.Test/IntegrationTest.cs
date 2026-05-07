@@ -311,7 +311,7 @@ public sealed class TcpStackIntegrationTest
             using var tcpClient = new TcpClient();
             
             // Allow WinDivert to settle after adapter start (helps when running after other WinDivert tests)
-            await Task.Delay(1000);
+            await Task.Delay(200);
 
             Console.WriteLine($"[TEST] Connecting to {TestServerIp}:{TestServerPort}...");
 
@@ -340,9 +340,10 @@ public sealed class TcpStackIntegrationTest
 
             // Assert
             Assert.AreEqual(TestDataSize, receivedData.Count, "Received data size should match sent data size");
-            
+
             var receivedArray = receivedData.ToArray();
-            CollectionAssert.AreEqual(testData, receivedArray, "Received data should match sent data exactly");
+            // Use Span-based comparison instead of CollectionAssert.AreEqual which is O(N) but slow for large arrays.
+            Assert.IsTrue(testData.AsSpan().SequenceEqual(receivedArray), "Received data should match sent data exactly");
 
             Console.WriteLine($"[TEST] ✅ Test passed! Successfully echoed {TestDataSize:N0} bytes through TCP stack");
             Console.WriteLine($"[TEST] Total packets received: {packetCount}, TCP packets: {tcpPacketCount}");
@@ -388,7 +389,6 @@ public sealed class TcpStackIntegrationTest
                             Console.WriteLine("[ECHO SERVER] Connection handler started - buffering all data before echoing");
                             var buffer = new byte[65536];
                             using var ms = new MemoryStream();
-                            var lastLoggedMb = 0L;
 
                             // Buffer ALL incoming data until the client half-closes (EOF).
                             while (true)
@@ -396,12 +396,6 @@ public sealed class TcpStackIntegrationTest
                                 var bytesRead = await stream.Stream.ReadAsync(buffer, 0, buffer.Length);
                                 if (bytesRead == 0) break;
                                 ms.Write(buffer, 0, bytesRead);
-
-                                var currentLogMb = ms.Length / (10 * 1024 * 1024);
-                                if (currentLogMb > lastLoggedMb) {
-                                    lastLoggedMb = currentLogMb;
-                                    Console.WriteLine($"[ECHO SERVER] Buffered {ms.Length / (1024 * 1024):N0} MB so far...");
-                                }
                             }
 
                             Console.WriteLine($"[ECHO SERVER] Received all {ms.Length:N0} bytes. Sending echo...");
@@ -436,41 +430,53 @@ public sealed class TcpStackIntegrationTest
     private static async Task SendDataInChunks(NetworkStream stream, byte[] data, int chunkSize)
     {
         var totalSent = 0;
-        
+        var nextLogMb = 50L;
+
         for (var offset = 0; offset < data.Length; offset += chunkSize)
         {
             var currentChunkSize = Math.Min(chunkSize, data.Length - offset);
-            await stream.WriteAsync(data, offset, currentChunkSize);
+            await stream.WriteAsync(data.AsMemory(offset, currentChunkSize));
             totalSent += currentChunkSize;
-            
-            if (totalSent % 10240 == 0) // Log every 10KB
+
+            // Log every 50MB only - excessive logging slows the test significantly.
+            if (totalSent / (1024 * 1024) >= nextLogMb)
             {
                 Console.WriteLine($"[CLIENT] Sent {totalSent:N0} bytes so far...");
+                nextLogMb += 50;
             }
         }
-        
+
         Console.WriteLine($"[CLIENT] Finished sending {totalSent:N0} bytes");
     }
 
     private static async Task ReceiveDataInChunks(NetworkStream stream, List<byte> receivedData, int expectedSize)
     {
+        // Pre-allocate a flat byte[] for fast appending; copy into List<byte> at the end.
+        var pooled = new byte[expectedSize];
         var buffer = new byte[8192];
         var totalReceived = 0;
-        
+        var nextLogMb = 50L;
+
         while (totalReceived < expectedSize)
         {
-            var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+            var bytesRead = await stream.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, expectedSize - totalReceived)));
             if (bytesRead == 0) break;
-            
-            receivedData.AddRange(buffer.Take(bytesRead));
+
+            Buffer.BlockCopy(buffer, 0, pooled, totalReceived, bytesRead);
             totalReceived += bytesRead;
-            
-            if (totalReceived % 10240 == 0) // Log every 10KB
+
+            // Log every 50MB only - excessive logging slows the test significantly.
+            if (totalReceived / (1024 * 1024) >= nextLogMb)
             {
                 Console.WriteLine($"[CLIENT] Received {totalReceived:N0} bytes so far...");
+                nextLogMb += 50;
             }
         }
-        
+
+        // Bulk-add to the caller's List<byte>.
+        receivedData.Capacity = totalReceived;
+        receivedData.AddRange(pooled.AsSpan(0, totalReceived));
+
         Console.WriteLine($"[CLIENT] Finished receiving {totalReceived:N0} bytes");
     }
 
