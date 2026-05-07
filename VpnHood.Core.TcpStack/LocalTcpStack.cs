@@ -24,6 +24,13 @@ public sealed class LocalTcpStack : ITcpStack
     // Max TCP window without window scaling.
     private const ushort LoopbackWindowSize = 0xFFFF;
 
+    /// <summary>Diagnostic logging hook for low-level TCP events (tests/diagnostics only).</summary>
+    public static Action<string>? DiagLog
+    {
+        get => LocalTcpConnection.DiagLog;
+        set => LocalTcpConnection.DiagLog = value;
+    }
+
     private readonly ConcurrentDictionary<IpEndPointQuad, LocalTcpConnection> _connections = new();
     private readonly ConcurrentDictionary<IpEndPointValue, LocalTcpListener> _listeners = new();
     private readonly Lock _anyListenerLock = new();
@@ -34,6 +41,14 @@ public sealed class LocalTcpStack : ITcpStack
     /// Callback invoked when a TCP packet needs to be sent out. The callback takes ownership of the packet.
     /// </summary>
     public Action<IpPacket>? OnPacketSend { get; set; }
+
+    /// <summary>
+    /// When <c>true</c>, the peer's advertised receive window is ignored and the send path
+    /// treats the window as always fully open (no flow-control backpressure).
+    /// When <c>false</c> (default), the sender respects the peer's window and waits when it is exhausted.
+    /// Useful for loopback scenarios where congestion cannot occur and maximum throughput is desired.
+    /// </summary>
+    public bool UseFixedSendWindow { get; set; }
 
     /// <summary>
     /// Creates a TCP listener on the specified local endpoint.
@@ -169,7 +184,8 @@ public sealed class LocalTcpStack : ITcpStack
 
         var isnLocal = (uint)RandomNumberGenerator.GetInt32(int.MaxValue);
         var peerMss = ParseMssOption(tcpPacket.Options.Span);
-        var connection = new LocalTcpConnection(endPointQuad, isnLocal, tcpPacket.SequenceNumber, peerMss, listener);
+        var peerWsShift = ParseWindowScaleOption(tcpPacket.Options.Span);
+        var connection = new LocalTcpConnection(endPointQuad, isnLocal, tcpPacket.SequenceNumber, peerMss, listener, peerWsShift);
         connection.OnClosed += OnConnectionClosed;
 
         if (!_connections.TryAdd(endPointQuad, connection)) {
@@ -190,12 +206,17 @@ public sealed class LocalTcpStack : ITcpStack
         // Without this option, the peer will send us 536-byte packets which dramatically
         // increases packet count (≈2.7x) and slows down the receive path through WinDivert.
         // Format: kind=2, len=4, value=MSS (16-bit big-endian).
+        // Window Scale option (kind=3, len=3, shift=0): enables WS negotiation so the peer
+        // can advertise windows larger than 64 KB in its ACKs. Our own shift=0 keeps our
+        // advertised window at the raw 65535 value (peer multiplies by 2^0 = 1).
+        // When UseFixedSendWindow is true, omit the WS option entirely so the peer cannot
+        // send scaled windows; the raw 16-bit field is capped at 65535 (LoopbackWindowSize).
         const ushort advertisedMss = 1460;
-        ReadOnlySpan<byte> options = [2, 4, (byte)(advertisedMss >> 8), (byte)(advertisedMss & 0xFF)];
-
-        // Intentionally omit Window Scale option from SYN-ACK so window scaling is
-        // disabled for this connection. Peer's WindowSize field will be interpreted
-        // as a raw 16-bit value (max 65535).
+        // MSS(4) + NOP(1) + WS(3) = 8 bytes, 4-byte aligned.
+        // MSS(4) only (no WS) = 4 bytes, already 4-byte aligned.
+        ReadOnlySpan<byte> options = UseFixedSendWindow
+            ? [2, 4, (byte)(advertisedMss >> 8), (byte)(advertisedMss & 0xFF)]
+            : [2, 4, (byte)(advertisedMss >> 8), (byte)(advertisedMss & 0xFF), 1, 3, 3, 0];
         var packet = PacketBuilder.BuildTcp(
             conn.EndPointQuad.Destination, conn.EndPointQuad.Source,
             options: options,
@@ -341,25 +362,40 @@ public sealed class LocalTcpStack : ITcpStack
         while (i < options.Length) {
             var kind = options[i];
             switch (kind) {
-                case 0: // End of option list
-                    return null;
-                case 1: // NOP - single byte
-                    i++;
-                    continue;
+                case 0: return null;
+                case 1: i++; continue;
             }
-
-            // Multibyte option: must have at least the length byte
             if (i + 1 >= options.Length) return null;
             var len = options[i + 1];
             if (len < 2 || i + len > options.Length) return null;
-
             if (kind == 2 && len == 4)
                 return (ushort)((options[i + 2] << 8) | options[i + 3]);
-
             i += len;
         }
-
         return null;
+    }
+
+    /// <summary>
+    /// Parses the TCP "Window Scale" option (kind=3, len=3) from the SYN options.
+    /// Returns 0 when the option is absent or malformed (no scaling).
+    /// </summary>
+    private static byte ParseWindowScaleOption(ReadOnlySpan<byte> options)
+    {
+        var i = 0;
+        while (i < options.Length) {
+            var kind = options[i];
+            switch (kind) {
+                case 0: return 0; // End of option list
+                case 1: i++; continue; // NOP
+            }
+            if (i + 1 >= options.Length) return 0;
+            var len = options[i + 1];
+            if (len < 2 || i + len > options.Length) return 0;
+            if (kind == 3 && len == 3) // Window Scale
+                return options[i + 2];
+            i += len;
+        }
+        return 0;
     }
 
     public void Dispose()

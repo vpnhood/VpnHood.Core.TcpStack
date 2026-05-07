@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<Description>Android TcpStack Echo Test with TUN adapter</Description>
+		<ApplicationTitle>TcpStack Test</ApplicationTitle>
+		<RootNamespace>VpnHood.Core.TcpStack.AndroidTest</RootNamespace>
+		<ApplicationId>com.vpnhood.tcpstack.androidtest</ApplicationId>
+		<ApplicationVersion>1</ApplicationVersion>
+		<TargetFramework>net10.0-android36.1</TargetFramework>
+		<OutputType>Exe</OutputType>
+		<ApplicationDisplayVersion>1.0.0</ApplicationDisplayVersion>
+		<SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
+	</PropertyGroup>
+
+	<PropertyGroup>
+		<IsTrimmable>False</IsTrimmable>
+		<Optimize>False</Optimize>
+		<PublishTrimmed>False</PublishTrimmed>
+		<RunAOTCompilation>False</RunAOTCompilation>
+		<AndroidEnableDebugging>true</AndroidEnableDebugging>
+		<EmbedAssembliesIntoApk>False</EmbedAssembliesIntoApk>
+	</PropertyGroup>
+
+	<PropertyGroup>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+		<LangVersion>latest</LangVersion>
+		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\VpnHood.Core.TcpStack\VpnHood.Core.TcpStack.csproj" />
+		<ProjectReference Include="..\..\VpnHood\Src\Core\VpnHood.Core.VpnAdapters.AndroidTun\VpnHood.Core.VpnAdapters.AndroidTun.csproj" />
+	</ItemGroup>
+
+</Project>

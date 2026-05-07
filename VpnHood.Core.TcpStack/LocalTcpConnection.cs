@@ -12,9 +12,14 @@ internal sealed class LocalTcpConnection(
     uint isnRemote,
     ushort? peerMss,
     LocalTcpListener listener,
+    byte peerWsShift = 0,
     TimeSpan? tcpTimeout = null)
     : IDisposable
 {
+    // Diagnostic logging hook (set from app for tests). Receives free-form lines.
+    public static Action<string>? DiagLog;
+    private static void Log(string msg) { try { DiagLog?.Invoke(msg); } catch { /* ignore */ } }
+
     // Static TCP receive window advertised to the peer (no window scaling).
     private const ushort LoopbackWindowSize = 0xFFFF;
 
@@ -52,10 +57,25 @@ internal sealed class LocalTcpConnection(
     private bool _appToNetCompleted;
     private uint _sndNxt = isnLocal; // SYN sequence; bumped to ISN+1 after SYN-ACK is sent.
     private uint _sndUna = isnLocal; // Oldest unacknowledged byte.
-    private uint _peerWindow = LoopbackWindowSize; // Peer's last advertised receive window.
+    private readonly byte _peerWsShift = peerWsShift > 14 ? (byte)14 : peerWsShift; // Peer's window scale shift (RFC 1323).
+    private uint _peerWindow = LoopbackWindowSize; // Peer's last advertised receive window (scaled).
     private uint _rcvNxt = isnRemote + 1; // We have already "consumed" the peer's SYN.
     private int _unackedSegments; // Count of in-order data segments not yet acknowledged.
+    private int _ackCount;
+    private int _lastZeroWinLogTick;
+    private int _lastZwpLogTick;
 
+    // Retransmission ring buffer: holds unacked bytes starting at _sndUna.
+    // On loopback we don't normally need retransmission, but TUN/kernel can drop
+    // packets under heavy load (no real "loss" but the effect is identical).
+    // RFC 5681 fast retransmit: 3 duplicate ACKs trigger retransmit of sndUna segment.
+    private const int RetxBufferSize = 64 * 1024; // bound in-flight unacked bytes
+    private readonly byte[] _retxBuffer = new byte[RetxBufferSize];
+    private int _retxRingStart;     // index in buffer corresponding to _sndUna
+    private int _retxBufferLen;     // number of valid unacked bytes
+    private uint _lastDupAck;
+    private int _dupAckCount;
+    private long _retxCount;
     public IpEndPointQuad EndPointQuad => endPointQuad;
     public uint IsnLocal { get; } = isnLocal;
     public ushort Mss { get; } = ClampMss(peerMss);
@@ -187,18 +207,65 @@ internal sealed class LocalTcpConnection(
 
             // Determine how much we can send within the peer's window.
             int allowable;
-            lock (_seqLock)
+            if (stack.UseFixedSendWindow)
             {
-                var inFlight = (long)(_sndNxt - _sndUna);
-                allowable = (int)Math.Max(0, _peerWindow - inFlight);
+                // Window tracking disabled: treat the window as always at the maximum size.
+                allowable = Math.Min(data.Length - offset, LoopbackWindowSize);
             }
-
-            if (allowable <= 0)
+            else
             {
+                // Drain any stale signal first, then snapshot the window.
+                // ACKs arriving during a burst leave a signal in the semaphore that
+                // doesn't correspond to new window space.  Draining before checking
+                // ensures we don't consume a signal and then find allowable==0 again.
                 DrainWindowSignal();
-                try { await _windowSignal.WaitAsync(ct); }
-                catch (OperationCanceledException) { return; }
-                continue;
+
+                uint pw, una, nxt;
+                int retxFree;
+                lock (_seqLock)
+                {
+                    pw = _peerWindow; una = _sndUna; nxt = _sndNxt;
+                    var inFlight = (long)(nxt - una);
+                    var fromPeer = (int)Math.Max(0, _peerWindow - inFlight);
+                    retxFree = RetxBufferSize - _retxBufferLen;
+                    allowable = Math.Min(fromPeer, retxFree);
+                }
+
+                if (allowable <= 0)
+                {
+                    var now = Environment.TickCount;
+                    if (now - _lastZeroWinLogTick > 500)
+                    {
+                        _lastZeroWinLogTick = now;
+                        Log($"[SEND] zero-win wait offset={offset}/{data.Length} pw={pw} sndUna={una} sndNxt={nxt} inFlight={(long)(nxt-una)}");
+                    }
+                    // Wait for peer window to open (signalled by TrySignalWindow when ACK arrives).
+                    // Use a timeout so we can send a Zero Window Probe (ZWP) if the peer does not
+                    // send a window update. This avoids a permanent stall when the peer (e.g. Android)
+                    // expects a stimulus before it sends the window update.
+                    // RFC 793: ZWP carries one byte of new data beyond the zero window.
+                    using var zwpCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    zwpCts.CancelAfter(TimeSpan.FromMilliseconds(200));
+                    try { await _windowSignal.WaitAsync(zwpCts.Token); }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        // Timeout: send a ZWP using the actual next data byte to elicit a window update.
+                        // Always send regardless of in-flight data: in loopback there is no reordering,
+                        // and relying on in-flight data as stimulus can stall permanently when the
+                        // semaphore signal is consumed without the window actually opening.
+                        if (offset < data.Length)
+                        {
+                            if (Environment.TickCount - _lastZwpLogTick > 500)
+                            {
+                                _lastZwpLogTick = Environment.TickCount;
+                                Log($"[SEND] ZWP fire offset={offset} pw={pw}");
+                            }
+                            offset += SendZeroWindowProbe(stack, data.Span[offset]);
+                        }
+                    }
+                    catch (OperationCanceledException) { return; }
+                    continue;
+                }
             }
 
             var remaining = data.Length - offset;
@@ -220,6 +287,11 @@ internal sealed class LocalTcpConnection(
                     seqForSegment = _sndNxt;
                     ackForSegment = _rcvNxt;
                     _sndNxt += (uint)segLen;
+                    // Append into retx ring buffer for fast retransmit support.
+                    // Skip when UseFixedSendWindow: window is unbounded so the buffer
+                    // would overflow, and retransmit is not needed in that mode.
+                    if (!stack.UseFixedSendWindow)
+                        AppendToRetxBufferLocked(segmentData);
                 }
 
                 tcp.SequenceNumber = seqForSegment;
@@ -256,13 +328,64 @@ internal sealed class LocalTcpConnection(
         // Process ACK: advance _sndUna and update peer's window.
         if (flags.HasFlag(TcpFlags.Ack))
         {
+            uint newPw;
+            long diff;
+            uint prevUna;
+            uint sndNxtSnap;
+            bool shouldFastRetx = false;
             lock (_seqLock)
             {
+                prevUna = _sndUna;
+                sndNxtSnap = _sndNxt;
                 // Only advance if ack is within [_sndUna, _sndNxt].
-                var diff = (long)(ack - _sndUna);
+                diff = (long)(ack - _sndUna);
                 if (diff > 0 && diff <= (long)(_sndNxt - _sndUna))
+                {
                     _sndUna = ack;
-                _peerWindow = windowSize;
+                    // Drop acknowledged bytes from retx buffer.
+                    var n = (int)diff;
+                    if (n >= _retxBufferLen)
+                    {
+                        _retxBufferLen = 0;
+                        _retxRingStart = 0;
+                    }
+                    else
+                    {
+                        _retxRingStart = (_retxRingStart + n) % RetxBufferSize;
+                        _retxBufferLen -= n;
+                    }
+                    _dupAckCount = 0;
+                    _lastDupAck = ack;
+                }
+                else if (diff == 0 && payload.Length == 0 && _retxBufferLen > 0)
+                {
+                    // Pure duplicate ACK: peer is missing data starting at _sndUna.
+                    if (ack == _lastDupAck) _dupAckCount++;
+                    else { _lastDupAck = ack; _dupAckCount = 1; }
+                    if (_dupAckCount >= 3)
+                    {
+                        shouldFastRetx = true;
+                        _dupAckCount = 0; // avoid retx flood; reset until next dup-ack triple
+                    }
+                }
+                // When UseFixedSendWindow is on, keep _peerWindow fixed at LoopbackWindowSize
+                // so the peer cannot dynamically shrink our effective send window.
+                if (_stack?.UseFixedSendWindow != true)
+                    _peerWindow = (uint)windowSize << _peerWsShift;
+                newPw = _peerWindow;
+            }
+            var ackCount = System.Threading.Interlocked.Increment(ref _ackCount);
+            // Only log significant events (avoid log spam):
+            //  - zero / very low advertised window
+            //  - ACK that doesn't advance _sndUna AND has no payload (pure dup-ack / probe)
+            //  - every 5000th ACK as a heartbeat
+            if (windowSize == 0 || newPw < 4096 || (diff <= 0 && payload.Length == 0) || (ackCount % 5000) == 0)
+                //Log($"[ACK#{ackCount}] ack={ack} prevUna={prevUna} nxt={sndNxtSnap} diff={diff} winRaw={windowSize} pw={newPw} payload={payload.Length} sig={_windowSignal.CurrentCount} dup={_dupAckCount}");
+            if (shouldFastRetx)
+            {
+                var n = System.Threading.Interlocked.Increment(ref _retxCount);
+                //Log($"[RETX#{n}] fast retransmit at sndUna={ack} retxLen={_retxBufferLen}");
+                FastRetransmit();
             }
             TrySignalWindow();
         }
@@ -466,9 +589,97 @@ internal sealed class LocalTcpConnection(
         }
     }
 
+    /// <summary>
+    /// Sends a Zero Window Probe: 1 byte of actual data at sndNxt, advancing sndNxt by 1.
+    /// Returns 1 if the probe was sent (so the caller can advance offset), 0 on failure.
+    /// This forces the peer to ACK with its current window size, breaking the zero-window stall.
+    /// </summary>
+    private int SendZeroWindowProbe(LocalTcpStack stack, byte probeByte)
+    {
+        if (_disposed || _appToNetCompleted) return 0;
+
+        IpPacket? probe = null;
+        try
+        {
+            ReadOnlySpan<byte> probeData = [probeByte];
+            probe = PacketBuilder.BuildTcp(EndPointQuad.Destination, EndPointQuad.Source,
+                options: ReadOnlySpan<byte>.Empty, payload: probeData);
+            var tcp = probe.ExtractTcp();
+
+            uint probeSeq;
+            uint probeAck;
+            lock (_seqLock)
+            {
+                probeSeq = _sndNxt;
+                probeAck = _rcvNxt;
+                _sndNxt += 1;
+            }
+
+            tcp.SequenceNumber = probeSeq;
+            tcp.AcknowledgmentNumber = probeAck;
+            tcp.Acknowledgment = true;
+            tcp.WindowSize = LoopbackWindowSize;
+
+            stack.SendPacket(probe);
+            return 1;
+        }
+        catch
+        {
+            probe?.Dispose();
+            return 0;
+        }
+    }
+
     private void DrainWindowSignal()
     {
         while (_windowSignal.Wait(0)) { }
+    }
+
+    // _seqLock must be held.
+    private void AppendToRetxBufferLocked(ReadOnlySpan<byte> segment)
+    {
+        if (segment.Length == 0) return;
+        // Caller has already enforced (segment.Length <= RetxBufferSize - _retxBufferLen) via allowable cap.
+        var writeIdx = (_retxRingStart + _retxBufferLen) % RetxBufferSize;
+        var firstChunk = Math.Min(segment.Length, RetxBufferSize - writeIdx);
+        segment[..firstChunk].CopyTo(_retxBuffer.AsSpan(writeIdx));
+        if (firstChunk < segment.Length)
+            segment[firstChunk..].CopyTo(_retxBuffer.AsSpan(0));
+        _retxBufferLen += segment.Length;
+    }
+
+    private void FastRetransmit()
+    {
+        var stack = _stack;
+        if (stack == null || _disposed) return;
+
+        // Build retransmit segment of up to MSS bytes from start of retx buffer.
+        byte[] payloadCopy;
+        uint seqForSegment;
+        uint ackForSegment;
+        lock (_seqLock)
+        {
+            if (_retxBufferLen == 0) return;
+            var segLen = Math.Min(_retxBufferLen, Mss);
+            payloadCopy = new byte[segLen];
+            var firstChunk = Math.Min(segLen, RetxBufferSize - _retxRingStart);
+            Array.Copy(_retxBuffer, _retxRingStart, payloadCopy, 0, firstChunk);
+            if (firstChunk < segLen)
+                Array.Copy(_retxBuffer, 0, payloadCopy, firstChunk, segLen - firstChunk);
+            seqForSegment = _sndUna;
+            ackForSegment = _rcvNxt;
+        }
+
+        var packet = PacketBuilder.BuildTcp(EndPointQuad.Destination, EndPointQuad.Source,
+            options: ReadOnlySpan<byte>.Empty, payload: payloadCopy);
+        var tcp = packet.ExtractTcp();
+        tcp.SequenceNumber = seqForSegment;
+        tcp.AcknowledgmentNumber = ackForSegment;
+        tcp.Acknowledgment = true;
+        tcp.WindowSize = LoopbackWindowSize;
+        tcp.Push = true;
+
+        stack.SendPacket(packet);
     }
 
     private void Close()
