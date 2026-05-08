@@ -23,7 +23,6 @@ public class TestVpnService : VpnService
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
     private const int TestDataSizeMb = 100;
-    private const bool UseFixedWindow = false;
     private const int WorkerCount = 2;
     private const int StallTimeoutSeconds = 30;
     private const int TestDataSize = TestDataSizeMb * 1024 * 1024;
@@ -83,7 +82,7 @@ public class TestVpnService : VpnService
         };
         using var adapter = new AndroidVpnAdapter(this, adapterSettings);
 
-        var tcpStack = new LocalTcpStack { UseFixedSendWindow = UseFixedWindow };
+        var tcpStack = new LocalTcpStack();
         LocalTcpStack.DiagLog = LogSystem;
         var packetCount = 0;
         var tcpPacketCount = 0;
