@@ -26,6 +26,8 @@ public class TestVpnService : VpnService
     private const int TestServerPort = 8080;
     private const int TestDataSizeMb = 100;
     private const bool UseFixedWindow = true;
+    private const int WorkerCount = 5;
+    private const int StallTimeoutSeconds = 30;
     private const int TestDataSize = TestDataSizeMb * 1024 * 1024;
 
     // Static log callback so the Activity can display lines
@@ -57,6 +59,7 @@ public class TestVpnService : VpnService
         return StartCommandResult.NotSticky;
     }
 
+    // Status messages: system log + UI window
     private void Log(string msg)
     {
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {msg}";
@@ -64,10 +67,15 @@ public class TestVpnService : VpnService
         OnLog?.Invoke(line);
     }
 
+    // Detailed/diagnostic messages: system log only
+    private void LogSystem(string msg)
+    {
+        Android.Util.Log.Info("TcpStackTest", $"[{DateTime.Now:HH:mm:ss.fff}] {msg}");
+    }
+
     private async Task RunEchoTest()
     {
-        Log("=== ECHO TEST START ===");
-        Log($"Data size: {TestDataSizeMb} MB, Server: {TestServerIp}:{TestServerPort}");
+        Log($"=== ECHO TEST START: {WorkerCount} workers x {TestDataSizeMb} MB ===");
 
         var adapterSettings = new AndroidVpnAdapterSettings
         {
@@ -77,11 +85,8 @@ public class TestVpnService : VpnService
         };
         using var adapter = new AndroidVpnAdapter(this, adapterSettings);
 
-        var tcpStack = new LocalTcpStack
-        {
-            UseFixedSendWindow = UseFixedWindow
-        };
-        LocalTcpStack.DiagLog = msg => Log(msg);
+        var tcpStack = new LocalTcpStack { UseFixedSendWindow = UseFixedWindow };
+        LocalTcpStack.DiagLog = msg => LogSystem(msg);
         var packetCount = 0;
         var tcpPacketCount = 0;
 
@@ -96,49 +101,51 @@ public class TestVpnService : VpnService
 
         var listener = tcpStack.Listen(new IpEndPointValue(TestServerIp, TestServerPort));
 
-        // Echo server
-        _ = Task.Run(async () =>
+        using var serverCts = new CancellationTokenSource();
+
+        // Echo server: accept all connections and handle each concurrently
+        var serverTask = Task.Run(async () =>
         {
             try
             {
-                await foreach (var stream in listener.AcceptAllAsync())
+                await foreach (var conn in listener.AcceptAllAsync(serverCts.Token))
                 {
-                    Log("[SERVER] Connection accepted!");
-                    var buf = new byte[65536];
-                    using var ms = new MemoryStream();
-                    while (true)
+                    var capturedConn = conn;
+                    _ = Task.Run(async () =>
                     {
-                        var n = await stream.Stream.ReadAsync(buf, 0, buf.Length);
-                        if (n == 0) break;
-                        ms.Write(buf, 0, n);
-                    }
-                    Log($"[SERVER] Received {ms.Length:N0} bytes. Echoing...");
-                    ms.Position = 0;
-                    var serverSentBytes = 0;
-                    var serverNextLog = 2 * 1024 * 1024;
-                    var serverSendBuf = new byte[65536];
-                    var serverSendSw = Stopwatch.StartNew();
-                    while (true)
-                    {
-                        var n = await ms.ReadAsync(serverSendBuf.AsMemory());
-                        if (n == 0) break;
-                        await stream.Stream.WriteAsync(serverSendBuf.AsMemory(0, n));
-                        serverSentBytes += n;
-                        if (serverSentBytes >= serverNextLog)
+                        try
                         {
-                            Log($"[SERVER] Echoed {serverSentBytes / (1024 * 1024)} MB ({serverSentBytes * 8.0 / serverSendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
-                            serverNextLog += 2 * 1024 * 1024;
+                            var buf = new byte[65536];
+                            using var ms = new MemoryStream();
+                            while (true)
+                            {
+                                var n = await capturedConn.Stream.ReadAsync(buf, 0, buf.Length);
+                                if (n == 0) break;
+                                ms.Write(buf, 0, n);
+                            }
+                            LogSystem($"[SERVER] Received {ms.Length:N0} bytes. Echoing...");
+                            ms.Position = 0;
+                            var sendBuf = new byte[65536];
+                            var sent = 0;
+                            var echoSw = Stopwatch.StartNew();
+                            while (true)
+                            {
+                                var n = await ms.ReadAsync(sendBuf.AsMemory());
+                                if (n == 0) break;
+                                await capturedConn.Stream.WriteAsync(sendBuf.AsMemory(0, n));
+                                sent += n;
+                            }
+                            LogSystem($"[SERVER] Echo done: {sent:N0} bytes in {echoSw.Elapsed.TotalSeconds:F2}s ({sent * 8.0 / echoSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+                            await capturedConn.DisposeAsync();
                         }
-                    }
-                    Log($"[SERVER] Echo complete: {serverSentBytes:N0} bytes in {serverSendSw.Elapsed.TotalSeconds:F2}s ({serverSentBytes * 8.0 / serverSendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
-                    await stream.DisposeAsync();
-                    break;
+                        catch (Exception ex) { LogSystem($"[SERVER] conn error: {ex.Message}"); }
+                    });
                 }
             }
-            catch (Exception ex) { Log($"[SERVER] Error: {ex.Message}"); }
+            catch (OperationCanceledException) { /* expected on shutdown */ }
+            catch (Exception ex) { Log($"[SERVER] Accept error: {ex.Message}"); }
         });
 
-        // Start TUN adapter
         var options = new VpnAdapterOptions
         {
             SessionName = "TcpStackTest",
@@ -154,54 +161,26 @@ public class TestVpnService : VpnService
             Log("TUN adapter started.");
             await Task.Delay(200);
 
-            // Generate test data
             var testData = new byte[TestDataSize];
             for (var i = 0; i < testData.Length; i++) testData[i] = (byte)(i % 251);
 
-            Log($"Connecting to {TestServerIp}:{TestServerPort}...");
-            using var tcpClient = new TcpClient();
-            tcpClient.NoDelay = true;
+            Log($"Launching {WorkerCount} workers...");
+            var totalSw = Stopwatch.StartNew();
 
-            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
-            await tcpClient.ConnectAsync(TestServerIp, TestServerPort, connectCts.Token);
-            Log("Connected!");
+            var workerTasks = Enumerable.Range(1, WorkerCount)
+                .Select(id => RunWorker(id, testData))
+                .ToArray();
 
-            await using var stream = tcpClient.GetStream();
+            var results = await Task.WhenAll(workerTasks);
+            totalSw.Stop();
 
-            var sw = Stopwatch.StartNew();
-            var receivedData = new byte[TestDataSize];
-            var receiveTask = ReceiveAll(stream, receivedData, TestDataSize);
-
-            // Send data
-            Log("Sending data...");
-            var sendSw = Stopwatch.StartNew();
-            const int chunkSize = 65536;
-            for (var offset = 0; offset < testData.Length; offset += chunkSize)
-            {
-                var len = Math.Min(chunkSize, testData.Length - offset);
-                await stream.WriteAsync(testData.AsMemory(offset, len), CancellationToken.None);
-                if (offset > 0 && offset % (5 * 1024 * 1024) == 0)
-                    Log($"  Sent {offset / (1024 * 1024)} MB ({offset * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
-            }
-            sendSw.Stop();
-            Log($"Send complete: {testData.Length:N0} bytes in {sendSw.Elapsed.TotalSeconds:F2}s " +
-                $"({testData.Length * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
-
-            tcpClient.Client.Shutdown(SocketShutdown.Send);
-
-            Log("Waiting for echo...");
-            using var echoCts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-            var totalReceived = await receiveTask.WaitAsync(echoCts.Token);
-            sw.Stop();
-
-            Log($"Received: {totalReceived:N0} bytes in {sw.Elapsed.TotalSeconds:F2}s");
-            Log($"Download throughput: {totalReceived * 8.0 / sw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s");
+            var passed = results.Count(r => r);
             Log($"Packets total={packetCount}, tcp={tcpPacketCount}");
 
-            if (totalReceived == TestDataSize && testData.AsSpan().SequenceEqual(receivedData.AsSpan(0, totalReceived)))
-                Log("=== TEST PASSED ===");
+            if (passed == WorkerCount)
+                Log($"=== TEST PASSED: {passed}/{WorkerCount} workers in {totalSw.Elapsed.TotalSeconds:F2}s ===");
             else
-                Log($"=== TEST FAILED === received={totalReceived}, expected={TestDataSize}");
+                Log($"=== TEST FAILED: {passed}/{WorkerCount} workers passed in {totalSw.Elapsed.TotalSeconds:F2}s ===");
         }
         catch (Exception ex)
         {
@@ -210,44 +189,95 @@ public class TestVpnService : VpnService
         }
         finally
         {
+            serverCts.Cancel();
             Log("Stopping adapter...");
             adapter.Stop();
             StopSelf();
         }
     }
 
-    private async Task<int> ReceiveAll(NetworkStream stream, byte[] buffer, int expectedSize)
+    private async Task<bool> RunWorker(int id, byte[] testData)
+    {
+        var tag = $"[W{id}]";
+        try
+        {
+            Log($"{tag} Connecting...");
+            using var tcpClient = new TcpClient { NoDelay = true };
+            using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            await tcpClient.ConnectAsync(TestServerIp, TestServerPort, connectCts.Token);
+            Log($"{tag} Connected!");
+
+            await using var stream = tcpClient.GetStream();
+
+            // Send all data first (echo server buffers everything before echoing back)
+            Log($"{tag} Sending {testData.Length / (1024 * 1024)} MB...");
+            var sendSw = Stopwatch.StartNew();
+            const int chunkSize = 65536;
+            for (var offset = 0; offset < testData.Length; offset += chunkSize)
+            {
+                var len = Math.Min(chunkSize, testData.Length - offset);
+                await stream.WriteAsync(testData.AsMemory(offset, len), CancellationToken.None);
+                if (offset > 0 && offset % (5 * 1024 * 1024) == 0)
+                    Log($"{tag} Sent {offset / (1024 * 1024)} MB ({offset * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+            }
+            sendSw.Stop();
+            Log($"{tag} Send done: {testData.Length / (1024 * 1024)} MB in {sendSw.Elapsed.TotalSeconds:F2}s ({testData.Length * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+
+            tcpClient.Client.Shutdown(SocketShutdown.Send);
+
+            // Now receive the echoed data
+            Log($"{tag} Receiving echo...");
+            var receivedData = new byte[TestDataSize];
+            using var echoCts = new CancellationTokenSource(TimeSpan.FromSeconds(StallTimeoutSeconds));
+            var totalReceived = await ReceiveAll(tag, stream, receivedData, TestDataSize, echoCts.Token);
+
+            if (totalReceived == TestDataSize && testData.AsSpan().SequenceEqual(receivedData.AsSpan(0, totalReceived)))
+            {
+                Log($"{tag} PASSED ({totalReceived:N0} bytes)");
+                return true;
+            }
+
+            Log($"{tag} FAILED: received={totalReceived}, expected={TestDataSize}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log($"{tag} ERROR: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private async Task<int> ReceiveAll(string tag, NetworkStream stream, byte[] buffer, int expectedSize, CancellationToken ct)
     {
         var readBuf = new byte[65536];
         var total = 0;
+        var stallCount = 0;
         var sw = Stopwatch.StartNew();
         var nextLogMb = 5;
-        var lastLogTime = sw.Elapsed;
         while (total < expectedSize)
         {
-            using var readCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            ct.ThrowIfCancellationRequested();
+            using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            readCts.CancelAfter(TimeSpan.FromSeconds(5));
             int n;
             try
             {
                 n = await stream.ReadAsync(readBuf.AsMemory(0, Math.Min(readBuf.Length, expectedSize - total)), readCts.Token);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                Log($"  STALL: received {total / 1024} KB in {sw.Elapsed.TotalSeconds:F1}s ({total * 8.0 / Math.Max(sw.Elapsed.TotalSeconds, 0.001) / 1_000_000:F1} Mbit/s), no data for 5s");
+                stallCount++;
+                Log($"{tag} STALL #{stallCount}: {total / 1024} KB received after {sw.Elapsed.TotalSeconds:F1}s");
                 continue;
             }
             if (n == 0) break;
+            stallCount = 0;
             Buffer.BlockCopy(readBuf, 0, buffer, total, n);
             total += n;
             if (total / (1024 * 1024) >= nextLogMb)
             {
-                Log($"  Recv {total / (1024 * 1024)} MB ({total * 8.0 / sw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+                Log($"{tag} Recv {total / (1024 * 1024)} MB ({total * 8.0 / sw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
                 nextLogMb += 5;
-            }
-            else if (sw.Elapsed - lastLogTime > TimeSpan.FromSeconds(10))
-            {
-                Log($"  Recv progress: {total / 1024} KB in {sw.Elapsed.TotalSeconds:F1}s");
-                lastLogTime = sw.Elapsed;
             }
         }
         return total;
