@@ -1,14 +1,22 @@
 <Solution>
+  <Folder Name="/Libs/">
+    <Project Path="../VpnHood/Src/Core/VpnHood.Core.Packets/VpnHood.Core.Packets.csproj" />
+    <Project Path="../VpnHood/Src/Core/VpnHood.Core.PacketTransports/VpnHood.Core.PacketTransports.csproj" />
+    <Project Path="../VpnHood/Src/Core/VpnHood.Core.Toolkit/VpnHood.Core.Toolkit.csproj" />
+    <Project Path="../VpnHood/Src/Core/VpnHood.Core.VpnAdapters.Abstractions/VpnHood.Core.VpnAdapters.Abstractions.csproj" />
+    <Project Path="../VpnHood/Src/Core/VpnHood.Core.VpnAdapters.AndroidTun/VpnHood.Core.VpnAdapters.AndroidTun.csproj" />
+    <Project Path="../VpnHood/Src/Core/VpnHood.Core.VpnAdapters.WinDivert/VpnHood.Core.VpnAdapters.WinDivert.csproj" />
+  </Folder>
   <Folder Name="/Solution Items/">
     <File Path=".github/copilot-instructions.md" />
     <File Path="README.md" />
-  </Folder>
-  <Project Path="../VpnHood/Src/Core/VpnHood.Core.Packets/VpnHood.Core.Packets.csproj" />
-  <Project Path="../VpnHood/Src/Core/VpnHood.Core.VpnAdapters.WinDivert/VpnHood.Core.VpnAdapters.WinDivert.csproj" />
-  <Project Path="VpnHood.Core.TcpStack.Abstractions/VpnHood.Core.TcpStack.Abstractions.csproj" />`n  
+  </Folder>`n  
+  
+  
+  <Project Path="VpnHood.Core.TcpStack.Abstractions/VpnHood.Core.TcpStack.Abstractions.csproj" />
   <Project Path="VpnHood.Core.TcpStack.AndroidTest/VpnHood.Core.TcpStack.AndroidTest.csproj">
     <Deploy />
-  </Project><Project Path="VpnHood.Core.TcpStack.LwIP/VpnHood.Core.TcpStack.LwIP.csproj" />
+  </Project>
   <Project Path="VpnHood.Core.TcpStack.Test/VpnHood.Core.TcpStack.Test.csproj" />
   <Project Path="VpnHood.Core.TcpStack/VpnHood.Core.TcpStack.csproj" />
 </Solution>

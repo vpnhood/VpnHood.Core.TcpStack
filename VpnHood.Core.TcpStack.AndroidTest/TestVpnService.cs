@@ -1,17 +1,15 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using Android;
-using Android.App;
 using Android.Content;
 using Android.Content.PM;
 using Android.Net;
 using Android.Runtime;
-using VpnHood.Core.Packets;
 using VpnHood.Core.Toolkit.Net;
 using VpnHood.Core.VpnAdapters.Abstractions;
 using VpnHood.Core.VpnAdapters.AndroidTun;
+// ReSharper disable AccessToDisposedClosure
 
 namespace VpnHood.Core.TcpStack.AndroidTest;
 
@@ -37,7 +35,7 @@ public class TestVpnService : VpnService
     public override StartCommandResult OnStartCommand(Intent? intent, [GeneratedEnum] StartCommandFlags flags, int startId)
     {
         // Must call startForeground quickly to avoid ANR on Android 14+
-        const string channelId = "tcpstack_test";
+        const string channelId = "tcp_stack_test";
         if (OperatingSystem.IsAndroidVersionAtLeast(26))
         {
             var channel = new NotificationChannel(channelId, "TcpStack Test", NotificationImportance.Low);
@@ -104,7 +102,7 @@ public class TestVpnService : VpnService
         using var serverCts = new CancellationTokenSource();
 
         // Echo server: accept all connections and handle each concurrently
-        var serverTask = Task.Run(async () =>
+        _ = Task.Run(async () =>
         {
             try
             {
@@ -119,7 +117,7 @@ public class TestVpnService : VpnService
                             using var ms = new MemoryStream();
                             while (true)
                             {
-                                var n = await capturedConn.Stream.ReadAsync(buf, 0, buf.Length);
+                                var n = await capturedConn.Stream.ReadAsync(buf, 0, buf.Length, serverCts.Token);
                                 if (n == 0) break;
                                 ms.Write(buf, 0, n);
                             }
@@ -130,7 +128,7 @@ public class TestVpnService : VpnService
                             var echoSw = Stopwatch.StartNew();
                             while (true)
                             {
-                                var n = await ms.ReadAsync(sendBuf.AsMemory());
+                                var n = await ms.ReadAsync(sendBuf, serverCts.Token);
                                 if (n == 0) break;
                                 await capturedConn.Stream.WriteAsync(sendBuf.AsMemory(0, n));
                                 sent += n;
@@ -139,12 +137,12 @@ public class TestVpnService : VpnService
                             await capturedConn.DisposeAsync();
                         }
                         catch (Exception ex) { LogSystem($"[SERVER] conn error: {ex.Message}"); }
-                    });
+                    }, serverCts.Token);
                 }
             }
             catch (OperationCanceledException) { /* expected on shutdown */ }
             catch (Exception ex) { Log($"[SERVER] Accept error: {ex.Message}"); }
-        });
+        }, serverCts.Token);
 
         var options = new VpnAdapterOptions
         {
