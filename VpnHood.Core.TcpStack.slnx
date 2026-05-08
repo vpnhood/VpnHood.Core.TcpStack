@@ -13,10 +13,11 @@
   </Folder>`n  
   
   
-  <Project Path="VpnHood.Core.TcpStack.Abstractions/VpnHood.Core.TcpStack.Abstractions.csproj" />
+  
+  <Project Path="../VpnHood/Src/Core/VpnHood.Core.TcpStack.Abstractions/VpnHood.Core.TcpStack.Abstractions.csproj" />
+  <Project Path="../VpnHood/Src/Core/VpnHood.Core.TcpStack/VpnHood.Core.TcpStack.csproj" />
+  <Project Path="../VpnHood/Tests/VpnHood.Core.TcpStack.Test/VpnHood.Core.TcpStack.Test.csproj" />
   <Project Path="VpnHood.Core.TcpStack.AndroidTest/VpnHood.Core.TcpStack.AndroidTest.csproj">
     <Deploy />
   </Project>
-  <Project Path="VpnHood.Core.TcpStack.Test/VpnHood.Core.TcpStack.Test.csproj" />
-  <Project Path="VpnHood.Core.TcpStack/VpnHood.Core.TcpStack.csproj" />
 </Solution>

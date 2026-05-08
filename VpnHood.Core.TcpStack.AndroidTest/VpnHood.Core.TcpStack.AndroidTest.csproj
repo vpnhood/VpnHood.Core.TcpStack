@@ -28,7 +28,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<ProjectReference Include="..\VpnHood.Core.TcpStack\VpnHood.Core.TcpStack.csproj" />
+		<ProjectReference Include="..\..\VpnHood\Src\Core\VpnHood.Core.TcpStack\VpnHood.Core.TcpStack.csproj" />
 		<ProjectReference Include="..\..\VpnHood\Src\Core\VpnHood.Core.VpnAdapters.AndroidTun\VpnHood.Core.VpnAdapters.AndroidTun.csproj" />
 	</ItemGroup>
 
