@@ -24,9 +24,9 @@ public class TestVpnService : VpnService
 {
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
-    private const int TestDataSizeMb = 100;
-    private const bool UseFixedWindow = true;
-    private const int WorkerCount = 5;
+    private const int TestDataSizeMb = 200;
+    private const bool UseFixedWindow = false;
+    private const int WorkerCount = 1;
     private const int StallTimeoutSeconds = 30;
     private const int TestDataSize = TestDataSizeMb * 1024 * 1024;
 
@@ -45,15 +45,15 @@ public class TestVpnService : VpnService
             nm?.CreateNotificationChannel(channel);
         }
 
+        if (!OperatingSystem.IsAndroidVersionAtLeast(34))
+            throw new NotSupportedException("Requires Android 14+ for foreground service without notification");
+
         var notification = new Notification.Builder(this, channelId)
             .SetContentTitle("TcpStack Test")
             .SetSmallIcon(Android.Resource.Drawable.IcMenuCompass)
             .Build();
 
-        if (OperatingSystem.IsAndroidVersionAtLeast(29))
-            StartForeground(1, notification, ForegroundService.TypeSystemExempted);
-        else
-            StartForeground(1, notification);
+        StartForeground(1, notification, ForegroundService.TypeSystemExempted);
 
         Task.Run(RunEchoTest);
         return StartCommandResult.NotSticky;
