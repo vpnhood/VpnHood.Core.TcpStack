@@ -22,9 +22,9 @@ public class TestVpnService : VpnService
 {
     private static readonly IPAddress TestServerIp = IPAddress.Parse("11.0.0.1");
     private const int TestServerPort = 8080;
-    private const int TestDataSizeMb = 200;
+    private const int TestDataSizeMb = 100;
     private const bool UseFixedWindow = false;
-    private const int WorkerCount = 1;
+    private const int WorkerCount = 2;
     private const int StallTimeoutSeconds = 30;
     private const int TestDataSize = TestDataSizeMb * 1024 * 1024;
 
@@ -58,7 +58,7 @@ public class TestVpnService : VpnService
     }
 
     // Status messages: system log + UI window
-    private void Log(string msg)
+    private static void Log(string msg)
     {
         var line = $"[{DateTime.Now:HH:mm:ss.fff}] {msg}";
         Android.Util.Log.Info("TcpStackTest", line);
@@ -66,7 +66,7 @@ public class TestVpnService : VpnService
     }
 
     // Detailed/diagnostic messages: system log only
-    private void LogSystem(string msg)
+    private static void LogSystem(string msg)
     {
         Android.Util.Log.Info("TcpStackTest", $"[{DateTime.Now:HH:mm:ss.fff}] {msg}");
     }
@@ -84,7 +84,7 @@ public class TestVpnService : VpnService
         using var adapter = new AndroidVpnAdapter(this, adapterSettings);
 
         var tcpStack = new LocalTcpStack { UseFixedSendWindow = UseFixedWindow };
-        LocalTcpStack.DiagLog = msg => LogSystem(msg);
+        LocalTcpStack.DiagLog = LogSystem;
         var packetCount = 0;
         var tcpPacketCount = 0;
 
@@ -130,10 +130,10 @@ public class TestVpnService : VpnService
                             {
                                 var n = await ms.ReadAsync(sendBuf, serverCts.Token);
                                 if (n == 0) break;
-                                await capturedConn.Stream.WriteAsync(sendBuf.AsMemory(0, n));
+                                await capturedConn.Stream.WriteAsync(sendBuf.AsMemory(0, n), serverCts.Token);
                                 sent += n;
                             }
-                            LogSystem($"[SERVER] Echo done: {sent:N0} bytes in {echoSw.Elapsed.TotalSeconds:F2}s ({sent * 8.0 / echoSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+                            LogSystem($"[SERVER] Echo done: {sent:N0} bytes in {echoSw.Elapsed.TotalSeconds:F2}s ({sent * 8.0 / echoSw.Elapsed.TotalSeconds / 1_000_000:F1} MBit/s)");
                             await capturedConn.DisposeAsync();
                         }
                         catch (Exception ex) { LogSystem($"[SERVER] conn error: {ex.Message}"); }
@@ -157,7 +157,7 @@ public class TestVpnService : VpnService
             Log("Starting TUN adapter...");
             await adapter.Start(options, CancellationToken.None);
             Log("TUN adapter started.");
-            await Task.Delay(200);
+            await Task.Delay(200, serverCts.Token);
 
             var testData = new byte[TestDataSize];
             for (var i = 0; i < testData.Length; i++) testData[i] = (byte)(i % 251);
@@ -187,20 +187,22 @@ public class TestVpnService : VpnService
         }
         finally
         {
-            serverCts.Cancel();
+            await serverCts.CancelAsync();
             Log("Stopping adapter...");
             adapter.Stop();
             StopSelf();
         }
     }
 
-    private async Task<bool> RunWorker(int id, byte[] testData)
+    private static async Task<bool> RunWorker(int id, byte[] testData)
     {
         var tag = $"[W{id}]";
         try
         {
             Log($"{tag} Connecting...");
-            using var tcpClient = new TcpClient { NoDelay = true };
+            using var tcpClient = new TcpClient();
+            tcpClient.NoDelay = true;
+
             using var connectCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             await tcpClient.ConnectAsync(TestServerIp, TestServerPort, connectCts.Token);
             Log($"{tag} Connected!");
@@ -216,10 +218,10 @@ public class TestVpnService : VpnService
                 var len = Math.Min(chunkSize, testData.Length - offset);
                 await stream.WriteAsync(testData.AsMemory(offset, len), CancellationToken.None);
                 if (offset > 0 && offset % (5 * 1024 * 1024) == 0)
-                    Log($"{tag} Sent {offset / (1024 * 1024)} MB ({offset * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+                    Log($"{tag} Sent {offset / (1024 * 1024)} MB ({offset * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} MBit/s)");
             }
             sendSw.Stop();
-            Log($"{tag} Send done: {testData.Length / (1024 * 1024)} MB in {sendSw.Elapsed.TotalSeconds:F2}s ({testData.Length * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+            Log($"{tag} Send done: {testData.Length / (1024 * 1024)} MB in {sendSw.Elapsed.TotalSeconds:F2}s ({testData.Length * 8.0 / sendSw.Elapsed.TotalSeconds / 1_000_000:F1} MBit/s)");
 
             tcpClient.Client.Shutdown(SocketShutdown.Send);
 
@@ -245,7 +247,7 @@ public class TestVpnService : VpnService
         }
     }
 
-    private async Task<int> ReceiveAll(string tag, NetworkStream stream, byte[] buffer, int expectedSize, CancellationToken ct)
+    private static async Task<int> ReceiveAll(string tag, NetworkStream stream, byte[] buffer, int expectedSize, CancellationToken ct)
     {
         var readBuf = new byte[65536];
         var total = 0;
@@ -274,7 +276,7 @@ public class TestVpnService : VpnService
             total += n;
             if (total / (1024 * 1024) >= nextLogMb)
             {
-                Log($"{tag} Recv {total / (1024 * 1024)} MB ({total * 8.0 / sw.Elapsed.TotalSeconds / 1_000_000:F1} Mbit/s)");
+                Log($"{tag} Recv {total / (1024 * 1024)} MB ({total * 8.0 / sw.Elapsed.TotalSeconds / 1_000_000:F1} MBit/s)");
                 nextLogMb += 5;
             }
         }
